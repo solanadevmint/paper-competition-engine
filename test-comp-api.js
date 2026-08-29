@@ -41,9 +41,19 @@ function mkReq(body, headers = {}) {
     on(ev, cb) { if (ev === 'data') chunks.forEach((c) => cb(c)); if (ev === 'end') cb(); return this; },
   };
 }
+/* The operator token is header-only now: a token in a JSON body lands in
+   request logs and proxy traces. Anything passing `token` in the body is
+   expected to be refused, which is asserted below. */
 const admin = async (body, headers) => {
   const res = mkRes();
-  await P.compAdmin(mkReq(body, headers), res);
+  const h = { ...(headers || {}) };
+  if (body && body.token && !h['x-comp-token']) { h['x-comp-token'] = body.token; }
+  await P.compAdmin(mkReq(body, h), res);
+  return res;
+};
+const adminBodyTokenOnly = async (body) => {
+  const res = mkRes();
+  await P.compAdmin(mkReq(body), res);   // deliberately no header
   return res;
 };
 const state = () => { const res = mkRes(); P.compState({}, res); return res.body; };
@@ -67,7 +77,8 @@ for (const s of ['BTC', 'SOL', 'ETH', 'BNB', 'XRP']) {
 comp.wire({
   openAlias: T.openAlias, closeAlias: T.closeAlias, scoreUser: T.scoreUser,
   // startRound now prepares the roster itself, so it needs the real hooks
-  resetPlayer: T.resetPlayerAccount, epochOf: T.epochOfUser,
+  prepareSeat: T.prepareSeat, seatState: T.seatState, markSetFor: T.markSetFor,
+  equityOf: (uid) => { const a = T.stmt.acctGet.get(uid); return a ? T.accountRisk(uid, a).equityTotal : NaN; },
   log: () => {},
 });
 const SEATS = [7001, 7002];
@@ -87,6 +98,10 @@ for (const uid of SEATS) {
   });
   r = await admin({ action: 'create', id: 'x', candidates: ['BTC', 'SOL'], token: 'wrong' });
   ok('a wrong token is forbidden', () => assert.strictEqual(r.code, 403));
+  r = await adminBodyTokenOnly({ action: 'create', id: 'x', candidates: ['BTC', 'SOL'], token: TOKEN });
+  ok('a token in the request BODY is refused', () => {
+    assert.strictEqual(r.code, 403, 'body tokens leak into logs; header only');
+  });
   r = await admin({ action: 'create', id: 'e2e', candidates: ['BTC', 'SOL', 'ETH'], backup: 'XRP', token: TOKEN,
                     players: SEATS.map((u, i) => ({ userId: u, displayName: 'P' + i, seat: i })) });
   ok('the operator token is accepted', () => {

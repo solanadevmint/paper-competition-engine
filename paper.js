@@ -41,6 +41,7 @@
 //    boundary (fundingIntervalSeconds=3600). Positive rate: longs pay.
 //  - marketStatus: 'active' required for taker fills; 'postOnly' (SKHY)
 //    accepts resting limits only. Closes always allowed.
+const crypto = require('crypto');
 const fs = require('fs');
 const auth = require('./auth-shim.js');
 const comp = require('./competition.js');
@@ -986,6 +987,7 @@ function ingestIndexTick(sym, px, now, comps, spreadBps) {
     if (!cur.indexHalt) live.map.set(sym, { ...cur, indexHalt: true });
     return;                                          // frozen: no price, no eval
   }
+  recordMark(sym, px, now);
   live.map.set(sym, { ...cur, indexHalt: false, markPrice: Number(cur.markPrice) > 0 ? cur.markPrice : px, pythPrice: px, pythAtMs: now, lastUpdatedMs: now, pythBasis: cur.pythBasis != null ? cur.pythBasis : (Number(cur.markPrice) > 0 ? null : 0) });
   live.lastMsgMs = now;
   pythHistPush(sym, now, px);
@@ -1131,6 +1133,7 @@ function startPythStream() {
     const cur = live.map.get(sym) || { symbol: sym };
     const curPub = Number(cur.pythPubTime) || 0;
     if (pub && curPub && (pub < curPub || (pub === curPub && v === cur.pythPrice))) return;   // older slot / duplicate
+    recordMark(sym, v, now);
     live.map.set(sym, { ...cur, markPrice: Number(cur.markPrice) > 0 ? cur.markPrice : v, pythPrice: v, pythAtMs: now, pythPubTime: pub || curPub, lastUpdatedMs: now, pythBasis: cur.pythBasis != null ? cur.pythBasis : (Number(cur.markPrice) > 0 ? null : 0) });
     live.lastMsgMs = now;
     pythHistPush(sym, now, v);
@@ -1184,7 +1187,11 @@ function init({ apiGet, warehouseGet, log, readRateOk } = {}) {
   // same schedule rather than stall the wall on a phase that never ends.
   comp.wire({
     openAlias, closeAlias, scoreUser,
-    resetPlayer: resetPlayerAccount, epochOf: epochOfUser,
+    prepareSeat, seatState, markSetFor,
+    equityOf: (uid) => {
+      const a = stmt.acctGet.get(uid);
+      return a ? accountRisk(uid, a).equityTotal : Number.NaN;
+    },
     log: (m) => _log(m),
   });
   try { comp.resume(); } catch (e) { _log('competition resume failed: ' + e.message); }
@@ -1218,6 +1225,15 @@ function readBody(req) {
   });
 }
 async function sessionUser(req) { return await auth.validateSession(auth.parseSessionCookie(req)); }
+/* One barrier, every write path. Returns true when the request was refused.
+   Previously only placeOrder knew about the bell, so closing a position or
+   adjusting margin still worked after the result was frozen. */
+function barred(res, userId) {
+  const why = comp.writeBarrier(userId);
+  if (!why) return false;
+  send(res, 409, { ok: false, error: why });
+  return true;
+}
 const r6 = (x) => Math.round(x * 1e6) / 1e6;
 const rpx = (x) => (!Number.isFinite(x) || Math.abs(x) >= 1 ? r6(x) : Number(x.toPrecision(9)));
 
@@ -1332,7 +1348,56 @@ function ensureAccount(userId) {
 const dirOf = (side) => (side === 'LONG' ? 1 : -1);
 const isIso = (p) => p.margin_mode === 'isolated';
 function uPnl(pos, mark) { return pos.size * (mark - pos.entry_price) * dirOf(pos.side); }
-function posMarkOf(pos) {
+/* Recent stage marks, per symbol, so a boundary can be priced at the instant
+   it was SCHEDULED rather than whenever its timer callback happened to run.
+   At 1000x a few hundred milliseconds of event-loop delay is worth real
+   money, and "the winner is whoever the scheduler favoured" is not a result
+   anyone can defend. Bounded by time and by count; pricing must never be
+   slowed by bookkeeping. */
+const MARK_HIST_MS = 180_000;
+const MARK_HIST_MAX = 900;
+const _markHist = new Map();     // sym -> [{t, p}] ascending
+function recordMark(sym, px, t) {
+  if (!(Number(px) > 0)) return;
+  let a = _markHist.get(sym);
+  if (!a) { a = []; _markHist.set(sym, a); }
+  a.push({ t, p: px });
+  if (a.length > MARK_HIST_MAX) a.splice(0, a.length - MARK_HIST_MAX);
+  const cut = t - MARK_HIST_MS;
+  while (a.length && a[0].t < cut) a.shift();
+}
+/** Last mark at or before `ts`. Falls back to the current mark when the
+ *  history does not reach back that far (a fresh process, say), which is the
+ *  old behaviour and is stated rather than hidden. */
+function markAt(sym, ts) {
+  const a = _markHist.get(sym);
+  if (a && a.length) {
+    for (let i = a.length - 1; i >= 0; i--) if (a[i].t <= ts) return a[i].p;
+  }
+  return markOfFreshFor(sym, true);
+}
+/** The canonical mark set for every symbol a roster is exposed to, as of
+ *  `ts`. One map, used for every player in a checkpoint, so two traders can
+ *  never be settled at different prices for the same instant. */
+function markSetAt(symbols, ts) {
+  const out = {};
+  for (const sym of new Set(symbols)) {
+    const px = markAt(baseOf(sym), ts);
+    if (Number.isFinite(px) && px > 0) out[sym] = r6(px);
+  }
+  return out;
+}
+
+/* Every symbol the roster is exposed to, priced as of the boundary's
+   scheduled instant. One set, shared by every player in the checkpoint. */
+function markSetFor(userIds, ts) {
+  const syms = [];
+  for (const uid of userIds) for (const p of stmt.posByUser.all(uid)) syms.push(p.symbol);
+  return markSetAt(syms, ts);
+}
+
+function posMarkOf(pos, marks = null) {
+  if (marks && Number(marks[pos.symbol]) > 0) return Number(marks[pos.symbol]);
   const m = mkt(pos.symbol);
   const px = m && markFor(m, isStage(heatOf(pos.user_id)));
   return Number.isFinite(px) && px > 0 ? px : (Number(pos.last_mark) || pos.entry_price);
@@ -1341,12 +1406,12 @@ function posMarkOf(pos) {
 // Cross positions share account equity; isolated positions live on their own
 // allocated margin (already moved out of balance) and are excluded from the
 // cross risk numbers. equityTotal is what the leaderboard/UI shows.
-function accountRisk(userId, acct, { excludeOrderId = null } = {}) {
+function accountRisk(userId, acct, { excludeOrderId = null, marks = null } = {}) {
   const positions = stmt.posByUser.all(userId);
   const orders = stmt.ordOpenByUser.all(userId).filter((o) => o.id !== excludeOrderId);
   let crossUpnl = 0, posMargin = 0, maint = 0, cancelTier = 0, isoValue = 0;
   for (const p of positions) {
-    const mk = posMarkOf(p);
+    const mk = posMarkOf(p, marks);
     if (isIso(p)) { isoValue += p.isolated_margin + uPnl(p, mk); continue; }
     crossUpnl += uPnl(p, mk);
     posMargin += (p.size * p.entry_price) / p.leverage;
@@ -1533,10 +1598,13 @@ const compRealized = db.prepare(
 const compHot = db.prepare(
   "SELECT COALESCE(SUM(realized_pnl), 0) AS v FROM paper_fills WHERE user_id = ? AND epoch = ? AND symbol = ? AND realized_pnl IS NOT NULL"
 );
-function scoreUser(userId, hotTicker, epoch = null) {
+function scoreUser(userId, hotTicker, epoch = null, startBalance = null, marks = null) {
   const acct = ensureAccount(userId);
-  const risk = accountRisk(userId, acct);
-  const start = acct.start_balance || START_BALANCE;
+  const risk = accountRisk(userId, acct, { marks });
+  /* Measure against the balance the ROUND bound, not the account's current
+     one: if anything restamps start_balance mid-round the result must not
+     move under it. */
+  const start = Number.isFinite(startBalance) ? startBalance : (acct.start_balance || START_BALANCE);
   /* Score the epoch the ROUND bound at its start, not whatever the account
      happens to be on now. If anything bumps the epoch mid-round, the result
      must not silently change basis underneath it. */
@@ -1550,30 +1618,38 @@ function scoreUser(userId, hotTicker, epoch = null) {
        and jump to 2x the instant the ticker force-closed, so every projected
        ranking inside the window was wrong. Because the segment closes into
        realised PnL, this transitions continuously rather than stepping. */
-    hotBonus: hotTicker ? r6(compHot.get(userId, ep, hotTicker).v + openHotPnl(userId, hotTicker)) : 0,
+    hotBonus: hotTicker ? r6(compHot.get(userId, ep, hotTicker).v + openHotPnl(userId, hotTicker, marks)) : 0,
   };
 }
 
 /* Mark-to-market value of an open position on the Hot ticker, 0 if flat. */
-function openHotPnl(userId, hotTicker) {
+function openHotPnl(userId, hotTicker, marks = null) {
   const p = stmt.posGet.get(userId, hotTicker);
   if (!p) return 0;
-  const mk = posMarkOf(p);
+  const mk = posMarkOf(p, marks);
   return Number.isFinite(mk) && mk > 0 ? uPnl(p, mk) : 0;
 }
 
 /* Operator-side account preparation, used by startRound so that resetting a
    roster is part of going live rather than a button someone must remember.
    Returns the account's NEW epoch so the round can bind its scoring basis. */
-function resetPlayerAccount(userId) {
+function prepareSeat(userId) {
   const now = Date.now();
   ensureAccount(userId);
   db.prepare('DELETE FROM paper_positions WHERE user_id = ?').run(userId);
   db.prepare("DELETE FROM paper_orders WHERE user_id = ? AND status = 'OPEN'").run(userId);
+  // stamp the contest's account spec, do not inherit whatever mode this
+  // account was in: stage bankroll, no fees, no funding, fractional lots
+  db.prepare('UPDATE paper_accounts SET heat = 1, start_balance = ? WHERE user_id = ?')
+    .run(HEAT_BALANCE, userId);
   stmt.acctReset.run(now, now, userId);
-  return stmt.acctGet.get(userId).epoch;
+  return seatState(userId);
 }
-const epochOfUser = (userId) => (stmt.acctGet.get(userId) || {}).epoch;
+function seatState(userId) {
+  const a = stmt.acctGet.get(userId);
+  if (!a) return null;
+  return { epoch: a.epoch, startBalance: a.start_balance ?? START_BALANCE, stage: isStage(a.heat) };
+}
 
 // ── competition HTTP surface ─────────────────────────────────────────────
 /* Operator actions carry their own token on top of the nginx gate: the gate
@@ -1581,8 +1657,48 @@ const epochOfUser = (userId) => (stmt.acctGet.get(userId) || {}).epoch;
  * /ftpaper is through the site. Fails closed — with no token configured,
  * nothing can start or abort a round. */
 const COMP_TOKEN = process.env.PAPER_COMP_TOKEN || '';
-const compAuthed = (req, body) =>
-  !!COMP_TOKEN && (body.token === COMP_TOKEN || req.headers['x-comp-token'] === COMP_TOKEN);
+/* Header only. A token in a JSON body ends up in request logs, proxy traces
+   and shell history far more readily than one in a header, and the operator
+   surface is the most valuable credential in the system. Comparison is
+   constant-time so a wrong token cannot be narrowed by timing. */
+function compAuthed(req) {
+  const got = String(req.headers['x-comp-token'] || '');
+  if (!COMP_TOKEN || !got || got.length !== COMP_TOKEN.length) return false;
+  try {
+    return crypto.timingSafeEqual(Buffer.from(got), Buffer.from(COMP_TOKEN));
+  } catch { return false; }
+}
+
+/* Operator actions are rate limited on their own budget: the engine's
+   per-user write limiter does not cover them, and an unbounded admin surface
+   is a way to hammer the database during a show. */
+const _opRate = { t: 0, n: 0 };
+const OP_PER_MIN = Number(process.env.PAPER_COMP_OPS_PER_MIN || 60);
+function opRateOk() {
+  const now = Date.now();
+  if (now - _opRate.t > 60_000) { _opRate.t = now; _opRate.n = 0; }
+  return ++_opRate.n <= OP_PER_MIN;
+}
+
+/* Every operator action, logged. Who did what to which round and whether it
+   worked, so a contested show has a record rather than a recollection. */
+db.exec(`CREATE TABLE IF NOT EXISTS paper_operator_log (
+  id       INTEGER PRIMARY KEY AUTOINCREMENT,
+  at       INTEGER NOT NULL,
+  action   TEXT    NOT NULL,
+  round_id TEXT,
+  ok       INTEGER NOT NULL,
+  detail   TEXT,
+  ip       TEXT
+)`);
+const _opLog = db.prepare('INSERT INTO paper_operator_log (at, action, round_id, ok, detail, ip) VALUES (?, ?, ?, ?, ?, ?)');
+function logOp(req, action, roundId, ok, detail) {
+  try {
+    _opLog.run(Date.now(), String(action || '?'), roundId || null, ok ? 1 : 0,
+      detail ? String(detail).slice(0, 400) : null,
+      String(req.headers['x-real-ip'] || '').slice(0, 45) || null);
+  } catch { /* logging must never break an operator action */ }
+}
 
 /* Live wall state. Public: this is what the room sees. The drawn market is
  * withheld until the reveal actually fires, so a spectator refreshing the
@@ -1594,8 +1710,26 @@ function compState(req, res) {
   const drawn = !!r.draw_at;
   const activeHot = r.active_hot_base || r.hot_base;
   const players = comp.playersOf(r.id).map((pl) => {
-    let s = { equity: 0, accountPnl: 0, realized: 0, hotBonus: 0 };
-    try { s = scoreUser(pl.user_id, drawn ? r.hot_base + '-HOT' : null); } catch {}
+    /* Score the ticker that actually TRADED (a fallback means that is not the
+       drawn one) on the epoch the round BOUND. Getting either wrong makes the
+       wall disagree with the frozen checkpoints, which is the one thing a
+       broadcast leaderboard must never do. */
+    let s = null;
+    let scoreError = null;
+    try {
+      s = scoreUser(pl.user_id, drawn ? `${activeHot}-HOT` : null, pl.epoch);
+    } catch (e) {
+      /* Never publish a fabricated zero. A transient failure that renders as
+         0.00 silently drops a leader to last place on a live wall; an explicit
+         error state is recoverable, a wrong number is not. */
+      scoreError = String(e.message || e).slice(0, 120);
+    }
+    if (!s) {
+      return {
+        userId: pl.user_id, name: pl.display_name, seat: pl.seat,
+        error: scoreError || 'unscoreable', positions: [],
+      };
+    }
     /* What they are holding, biggest first. The wall has to answer "what is
        she actually trading" without the operator narrating it, and a rank
        with no position behind it is the least interesting thing on a screen.
@@ -1617,8 +1751,13 @@ function compState(req, res) {
       userId: pl.user_id, name: pl.display_name, seat: pl.seat,
       ...s, score: r6(s.accountPnl + s.hotBonus), positions,
     };
-  }).sort((a, b) => b.score - a.score || b.realized - a.realized || a.seat - b.seat)
+  });
+  /* Unscoreable seats are held out of the ranking rather than sorted as if
+     their score were zero, and reported separately so the wall can say so. */
+  const scored = players.filter((x) => !x.error)
+    .sort((a, b) => b.score - a.score || b.realized - a.realized || a.seat - b.seat)
     .map((x, i) => ({ ...x, rank: i + 1 }));
+  const failed = players.filter((x) => x.error);
   return send(res, 200, {
     ok: true, live: true, now: Date.now(),
     round: { id: r.id, kind: r.kind, startedAt: r.started_at, endsAt: r.ends_at },
@@ -1638,7 +1777,10 @@ function compState(req, res) {
     // than what the schedule intended.
     boostOpen: [...openAliases.keys()].some((k) => aliasKind(k) === 'BOOST'),
     boostMarkets: [...openAliases.keys()].filter((k) => aliasKind(k) === 'BOOST').map(baseOf),
-    players,
+    players: scored,
+    // present and non-empty means the board is incomplete: show it, do not rank it
+    unscored: failed,
+    complete: failed.length === 0,
   });
 }
 
@@ -1658,19 +1800,46 @@ function compVerify(req, res, u) {
 
 async function compAdmin(req, res) {
   let body; try { body = JSON.parse(await readBody(req) || '{}'); } catch { return send(res, 400, { ok: false, error: 'bad_json' }); }
-  if (!compAuthed(req, body)) return send(res, 403, { ok: false, error: 'forbidden' });
   const a = String(body.action || '');
+  if (!compAuthed(req)) {
+    logOp(req, a, body.id, false, 'forbidden');
+    return send(res, 403, { ok: false, error: 'forbidden' });
+  }
+  if (!opRateOk()) {
+    logOp(req, a, body.id, false, 'rate_limited');
+    return send(res, 429, { ok: false, error: 'rate_limited' });
+  }
   try {
     if (a === 'create') {
-      return send(res, 200, { ok: true, round: comp.createRound(body) });
+      const r = comp.createRound(body);
+      logOp(req, a, r.id, true, `commit ${String(r.draw_commit).slice(0, 16)}`);
+      return send(res, 200, { ok: true, round: r });
     }
     if (a === 'start') {
-      // prepare:false only for a rehearsal that deliberately keeps balances
-      return send(res, 200, { ok: true, round: comp.startRound(body.id, { prepare: body.prepare !== false }) });
+      /* prepare:false skips the uniform account stamp and is a rehearsal-only
+         escape hatch. It is refused unless explicitly enabled, because an
+         operator reaching for it during a show would start a round on
+         whatever balances happened to be there. */
+      const prepare = body.prepare !== false;
+      if (!prepare && process.env.PAPER_ALLOW_UNPREPARED !== '1') {
+        logOp(req, a, body.id, false, 'prepare:false refused');
+        return send(res, 400, { ok: false, error: 'prepare:false is not permitted here' });
+      }
+      const r = comp.startRound(body.id, { prepare });
+      logOp(req, a, r.id, true, `bell ${new Date(r.ends_at).toISOString()}`);
+      return send(res, 200, { ok: true, round: r });
     }
-    if (a === 'abort') return send(res, 200, { ok: true, round: comp.abortRound(body.id) });
+    if (a === 'abort') {
+      const r = comp.abortRound(body.id);
+      logOp(req, a, r.id, true, null);
+      return send(res, 200, { ok: true, round: r });
+    }
     if (a === 'standings') {
       return send(res, 200, { ok: true, board: comp.standings(body.id, body.checkpoint || 'final') });
+    }
+    if (a === 'clearBlock') {
+      // deliberate operator recovery; the only way a blocked round resumes
+      return send(res, 200, { ok: true, round: comp.clearBlock(body.id, { note: body.note || '' }) });
     }
     if (a === 'firstFive') return send(res, 200, { ok: true, ...comp.firstFiveResult(body.id) });
     /* Fresh accounts for the next round: bump the epoch and restore the
@@ -1678,6 +1847,16 @@ async function compAdmin(req, res) {
        player by hand is how someone ends up starting a round on a stale
        balance, which is the funding pre-flight lesson from Belgrade. */
     if (a === 'resetPlayers') {
+      /* Preparation belongs to startRound. Resetting mid-round bumped the
+         account epoch while the roster kept the old one, so equity and the
+         bound scoring basis silently disagreed. Armed rounds only. */
+      const r0 = comp.__test.q.get.get(body.id);
+      if (!r0) return send(res, 400, { ok: false, error: 'no such round' });
+      if (r0.status !== 'armed') {
+        const why = `round is ${r0.status}; preparation only happens on an armed round`;
+        logOp(req, a, body.id, false, why);
+        return send(res, 409, { ok: false, error: why });
+      }
       const players = comp.playersOf(body.id);
       if (!players.length) return send(res, 400, { ok: false, error: 'no players on that round' });
       const now = Date.now();
@@ -1690,6 +1869,7 @@ async function compAdmin(req, res) {
         done.push({ userId: p.user_id, name: p.display_name, epoch: stmt.acctGet.get(p.user_id).epoch });
       }
       _log(`round ${body.id}: reset ${done.length} players`);
+      logOp(req, a, body.id, true, `${done.length} seats`);
       return send(res, 200, { ok: true, reset: done });
     }
     /* Pre-flight: is every seat actually ready? Equivalent of the funding
@@ -1710,8 +1890,10 @@ async function compAdmin(req, res) {
       });
       return send(res, 200, { ok: true, allReady: rows.every((r) => r.ready), players: rows });
     }
+    logOp(req, a, body.id, false, 'unknown action');
     return send(res, 400, { ok: false, error: 'unknown action' });
   } catch (e) {
+    logOp(req, a, body.id, false, e.message);
     return send(res, 400, { ok: false, error: e.message });
   }
 }
@@ -1733,7 +1915,15 @@ function openAlias(alias, roundId = null) {
 // position on it at the index. Reuses applyFill, so these closes produce
 // ordinary fills, realised PnL and audit rows like any other close — the
 // segment bonus is simply what got realised, with no snapshot to reconcile.
-function closeAlias(alias, { flatten = true } = {}) {
+function closeAlias(alias, { flatten = true, roundId = null } = {}) {
+  /* Aliases are global but owned. Without this check, aborting a round that
+     never opened anything could close the LIVE round's tickers and flatten
+     its positions. */
+  const owner = openAliases.get(alias);
+  if (roundId && owner && owner.roundId && owner.roundId !== roundId) {
+    _log(`alias close ${alias}: owned by round ${owner.roundId}, refusing on behalf of ${roundId}`);
+    return { alias, closed: 0, total: 0, skipped: 'not_owner' };
+  }
   openAliases.delete(alias);
   /* Cancel anything resting on the ticker BEFORE settling it. A limit order
      left open on a closed segment would fill later and reopen exposure the
@@ -1749,21 +1939,31 @@ function closeAlias(alias, { flatten = true } = {}) {
   // marking: positions stay exactly where they are and the final snapshot
   // prices them, so nobody gains from closing faster at the end.
   if (!flatten) { _log(`alias close ${alias}: gate shut, positions left open`); return { alias, closed: 0, total: 0 }; }
+  /* ONE canonical mark for the whole segment, taken once. Fetching a mark per
+     player meant two traders could settle the same segment at different
+     prices, and a momentarily missing mark silently left someone open with a
+     live bonus after the window had scored. */
   const ps = stmt.posBySymbol.all(alias);
-  let closed = 0;
-  for (const p of ps) {
-    const mark = markOfFreshFor(alias, true);
-    if (!(Number(mark) > 0)) { _log(`alias close ${alias}: no mark, leaving ${p.user_id} open`); continue; }
-    const cSide = p.side === 'LONG' ? 'SELL' : 'BUY';
-    applyFill(p.user_id, {
-      symbol: alias, orderSide: cSide, size: p.size,
-      px: execPxFor(p.user_id, alias, cSide, p.size, mark).px,
-      feeBps: cfgOf(alias).takerBps, kind: 'SEGMENT',
-    });
-    closed += 1;
+  if (!ps.length) { _log(`alias close ${alias}: nothing open`); return { alias, closed: 0, total: 0, mark: null }; }
+  const mark = markOfFreshFor(alias, true);
+  if (!(Number(mark) > 0)) {
+    // fail closed: the caller records the boundary as failed and blocks
+    throw new Error(`cannot settle ${alias}: no fresh mark`);
   }
-  _log(`alias close ${alias}: flattened ${closed}/${ps.length}`);
-  return { alias, closed, total: ps.length };
+  db.transaction(() => {
+    for (const p of ps) {
+      const cSide = p.side === 'LONG' ? 'SELL' : 'BUY';
+      applyFill(p.user_id, {
+        symbol: alias, orderSide: cSide, size: p.size,
+        px: execPxFor(p.user_id, alias, cSide, p.size, mark).px,
+        feeBps: cfgOf(alias).takerBps, kind: 'SEGMENT',
+      });
+    }
+    const left = stmt.posBySymbol.all(alias).length;
+    if (left) throw new Error(`settle ${alias} incomplete: ${left} position(s) still open`);
+  })();
+  _log(`alias close ${alias}: settled ${ps.length} at ${mark}`);
+  return { alias, closed: ps.length, total: ps.length, mark };
 }
 
 // ── shared risk evaluation: one code path for the 5s sweep AND per-tick ──
@@ -2118,9 +2318,7 @@ async function placeOrder(req, res) {
   if (!(levCap2 > 0)) return send(res, 400, { ok: false, error: 'market_closed' });
   if (leverage > levCap2) leverage = levCap2;
   // A round that ended during the yield must not accept another write.
-  if (comp.settledFor(u.id)) {
-    return send(res, 409, { ok: false, error: 'round_settled' });
-  }
+  if (barred(res, u.id)) return;
   const mark2 = markOfFreshFor(symbol, isStage(acctH.heat)) ?? mark;   // refresh after the await
   const acct = ensureAccount(u.id);
   const risk = accountRisk(u.id, acct);
@@ -2253,6 +2451,7 @@ async function placeOrder(req, res) {
 // POST /api/paper/cancel {orderId}
 async function cancelOrder(req, res) {
   const u = await sessionUser(req); if (!u) return send(res, 401, { ok: false, error: 'not_signed_in' });
+  if (barred(res, u.id)) return;
   if (!writeRateOk(u.id)) return send(res, 429, { ok: false, error: 'rate_limited' });
   let body; try { body = JSON.parse(await readBody(req) || '{}'); } catch { return send(res, 400, { ok: false, error: 'bad_json' }); }
   const o = stmt.ordGet.get(Number(body.orderId));
@@ -2264,6 +2463,7 @@ async function cancelOrder(req, res) {
 // POST /api/paper/close {symbol, size?|sizeUsd?|pct?}  (omit = full close)
 async function closePosition(req, res) {
   const u = await sessionUser(req); if (!u) return send(res, 401, { ok: false, error: 'not_signed_in' });
+  if (barred(res, u.id)) return;
   if (!writeRateOk(u.id)) return send(res, 429, { ok: false, error: 'rate_limited' });
   let body; try { body = JSON.parse(await readBody(req) || '{}'); } catch { return send(res, 400, { ok: false, error: 'bad_json' }); }
   const symbol = String(body.symbol || '').toUpperCase();
@@ -2301,6 +2501,7 @@ async function closePosition(req, res) {
 // mirrors Phoenix TransferCollateral between cross and the child subaccount)
 async function adjustMargin(req, res) {
   const u = await sessionUser(req); if (!u) return send(res, 401, { ok: false, error: 'not_signed_in' });
+  if (barred(res, u.id)) return;
   if (!writeRateOk(u.id)) return send(res, 429, { ok: false, error: 'rate_limited' });
   let body; try { body = JSON.parse(await readBody(req) || '{}'); } catch { return send(res, 400, { ok: false, error: 'bad_json' }); }
   const symbol = String(body.symbol || '').toUpperCase();
@@ -2333,6 +2534,7 @@ async function adjustMargin(req, res) {
 // POST /api/paper/sltp {symbol, sl?, tp?}
 async function setSltp(req, res) {
   const u = await sessionUser(req); if (!u) return send(res, 401, { ok: false, error: 'not_signed_in' });
+  if (barred(res, u.id)) return;
   if (!writeRateOk(u.id)) return send(res, 429, { ok: false, error: 'rate_limited' });
   let body; try { body = JSON.parse(await readBody(req) || '{}'); } catch { return send(res, 400, { ok: false, error: 'bad_json' }); }
   const symbol = String(body.symbol || '').toUpperCase();
@@ -2745,6 +2947,9 @@ async function leaderboard(req, res) {
 // try/catch so one poisoned row can't stall the engine.
 let _sweepRunning = false;
 let _lastPruneMs = 0;
+function sampleRoundDrawdown() {
+  try { comp.sampleDrawdown(); } catch (e) { _log('drawdown sample failed: ' + e.message); }
+}
 function sweep() {
   if (_sweepRunning) return;
   _sweepRunning = true;
@@ -2866,9 +3071,13 @@ function sweep() {
   } finally {
     _sweepRunning = false;
   }
+  /* After the sweep's transaction, never inside it: drawdown sampling is
+     bookkeeping for a tie-break and must never be able to stall pricing or
+     liquidation. */
+  sampleRoundDrawdown();
 }
 
 module.exports = { init, sweep, account, comp, compState, compVerify, compAdmin, guestSession, stageCandles, placeOrder, cancelOrder, closePosition, setSltp, adjustMargin, reset, fills, ordersHistory, leaderboard, engineConfig, marketTape, pythHistory, pythStream, attachIndexWs };
 // Internal handles for the test harness / FT port test suite. Read-mostly;
 // requiring the module does not start the WS or any timers (that is init's job).
-module.exports.__test = { prints, live, mktCfg, stmt, db, sweep, tickEval, applyFill, openAlias, closeAlias, aliasOpen: (s) => aliasOpen(s), scoreUser, accountRisk, liqEstimate, resetPlayerAccount, epochOfUser, baseOf, aliasKind, aliasOpen, openAliases, openAlias, closeAlias, cfgOf, stageLevCap, mkt, ingestPrint, printedVolumeThrough, books, writeRate: _writeRate, guardCheck, comps: _idxComps, halt: _halt, ingestIndexTick, compUpdate };
+module.exports.__test = { prints, live, mktCfg, stmt, db, sweep, tickEval, recordMark, markAt, markSetAt, markSetFor, applyFill, openAlias, closeAlias, aliasOpen: (s) => aliasOpen(s), scoreUser, accountRisk, liqEstimate, prepareSeat, seatState, seatState_epoch: (u) => (seatState(u) || {}).epoch, baseOf, aliasKind, aliasOpen, openAliases, openAlias, closeAlias, cfgOf, stageLevCap, mkt, ingestPrint, printedVolumeThrough, books, writeRate: _writeRate, guardCheck, comps: _idxComps, halt: _halt, ingestIndexTick, compUpdate };

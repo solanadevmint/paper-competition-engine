@@ -38,7 +38,8 @@ let _ep = 1;
 comp.wire({
   openAlias: T.openAlias, closeAlias: T.closeAlias, log: (m) => logs.push(m),
   // this suite exercises the clock and the draw, not account state
-  resetPlayer: () => (_ep += 1), epochOf: () => _ep,
+  prepareSeat: () => ({ epoch: (_ep += 1), startBalance: 10, stage: true }),
+  seatState: () => ({ epoch: _ep, startBalance: 10, stage: true }),
 });
 /* startRound now refuses an empty roster, because a round with no players
    cannot be scored and should never reach a stage. Every round here gets a

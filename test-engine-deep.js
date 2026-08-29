@@ -67,7 +67,8 @@ for (const s of ['BTC', 'SOL', 'ETH', 'BNB', 'XRP']) { setMark(s, 100); T.mktCfg
 comp.wire({
   openAlias: T.openAlias, closeAlias: T.closeAlias, scoreUser: T.scoreUser,
   // startRound now prepares the roster itself, so it needs the real hooks
-  resetPlayer: T.resetPlayerAccount, epochOf: T.epochOfUser,
+  prepareSeat: T.prepareSeat, seatState: T.seatState, markSetFor: T.markSetFor,
+  equityOf: (uid) => { const a = T.stmt.acctGet.get(uid); return a ? T.accountRisk(uid, a).equityTotal : NaN; },
   log: () => {},
 });
 

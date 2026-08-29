@@ -23,7 +23,7 @@ New in this snapshot:
 | `competition.js` | Round clock, phase gate, verifiable market draw, scoring. Entirely new. |
 | `paper.js` | Engine. New: alias tickers, the order-path gate, `scoreUser`, the competition HTTP handlers. Everything else predates this work. |
 | `server.js` | HTTP routing. Three new routes. |
-| `test-*.js` | 129 assertions, all passing. |
+| `test-*.js` | 149 assertions, all passing. |
 | `test-integrity.js` | **New.** One case per blocker from the first review round. Adversarial rather than functional: nothing here describes what a well-behaved player does, and all of it changes a published result if it regresses. |
 
 ---
@@ -140,24 +140,77 @@ All ten reported ship blockers are closed, each with a regression test in
 roster row, so preflight and reset are no longer optional buttons and scoring
 cannot change basis mid-round.
 
+## Fixed since the second review
+
+Every P0 and P1 from round two is closed except one, noted at the end.
+
+**Round and account lifecycle.** `startRound` stamps a uniform account spec
+(stage mode, one bankroll, no positions, no resting orders, fresh epoch) and
+binds both the epoch and the starting balance onto the roster row; a seat that
+is not in stage mode refuses the start. It also refuses to start when the
+committed seed is gone. `prepare:false` is rejected unless explicitly enabled
+by environment. Operator `resetPlayers` is refused on anything but an armed
+round.
+
+**`blocked` is a real state.** It halts every boundary and bars every player
+write. Recovery is a deliberate, audited `clearBlock` that also resets failed
+boundaries to retryable, which is the only way the clock restarts.
+
+**One mutation barrier.** `writeBarrier` is consulted by order, cancel, close,
+SL/TP and margin. Closing a position after the bell is a 409, not a 200.
+
+**Phase is authoritative for segments.** Hot no longer relies on the volatile
+gate alone, so a late or failed hot-end timer cannot leave the ticker
+tradable.
+
+**Alias ownership.** `closeAlias` verifies the owner and refuses on behalf of
+another round; aborting an armed round touches nothing. The Boost market set
+is persisted on the round at arm time.
+
+**Restart recovery.** Boundaries left `running` by a dead process are demoted
+to retryable on boot. A restart that missed an unrun boundary **blocks**
+rather than continuing, so a show that did not happen is never resumed as
+though it had. Segment gates are rebuilt from durable state
+(`rehydrateGates`) rather than by replaying a succeeded boundary.
+
+**Checkpoints.** Every stored scalar is validated, the write is a plain INSERT
+inside a transaction that asserts the row count, and idempotency is explicit:
+a complete checkpoint is returned as-is and a partial one is a fault worth
+blocking on.
+
+**Hot close is canonical.** One mark for the whole segment, taken once,
+settled in a transaction that asserts nothing remains. A missing mark throws,
+which fails the boundary and blocks the round.
+
+**Event-time settlement.** Checkpoints are priced from a short per-symbol mark
+history as of the instant the boundary was **due**, not when its callback ran,
+and the exact mark set plus the scheduled timestamp are stored on every score
+row for replay. Lateness is logged.
+
+**Operator surface.** Token is header-only with constant-time comparison,
+rate-limited on its own budget, and every action is written to
+`paper_operator_log` including refusals.
+
+**Drawdown.** Peak equity and deepest fall are sampled from the sweep, outside
+its transaction, so the published tie-break (score, then lowest drawdown, then
+realised PnL, then seat) is now actually implemented.
+
 ## Known gaps, still open
 
-- **Maximum drawdown is not tracked per round.** The format's first tie-break
-  is lowest drawdown; ranking falls through to realised PnL, then seat.
+- **Boundaries still fire from timers, not from the event stream.** This is
+  the one round-two P0 not fully closed. Checkpoints are now priced at their
+  scheduled instant, which removes the result-changing symptom, but the
+  reviewer's broader design — every incoming tick and order first executing
+  any boundary whose time has passed — is not implemented. Stated plainly
+  rather than claimed as done.
 - **A flip clears the legacy per-position boost clock** in `applyFill`. Public
   paper product only; the competition no longer uses that path at all.
-- **Hot close settles player by player**, not from one canonical mark, and a
-  missing mark leaves that player open.
-- **The wall publishes zeroes if scoring throws** rather than showing an error
-  state.
-- **The operator token is accepted in the body as well as a header**, and
-  comparison is not constant-time. No operator audit table yet.
-- **Checkpoints store scalar outputs, not the mark set used**, so a disputed
-  result cannot be independently replayed tick by tick.
 - **The backup market is not inside the commitment.** It is declared at arm
-  time and published with a reason, but not hashed.
-- No rate limiting on the competition endpoints beyond the existing per-user
-  write limiter.
+  time and published with a reason and the drawn market, but not hashed.
+- **The mark history is in memory**, so a checkpoint taken within seconds of a
+  process start falls back to the current mark. Stated in `markAt`.
+- No idempotency keys on operator actions (they are rate-limited and audited,
+  but a retried request is a fresh action).
 - The engine runs a $10 bankroll displayed as $100,000 (a 10,000x display
   scale). Order sizes execute at 1/10,000th of displayed size so fills stay at
   top of book. Easy to misread when auditing figures.

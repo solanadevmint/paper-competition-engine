@@ -34,6 +34,10 @@ function mkRes() {
   const r = { code: null, body: null, writeHead(c) { r.code = c; }, end(s) { r.body = JSON.parse(s); } };
   return r;
 }
+const mkReqH = (body, headers) => {
+  const buf = Buffer.from(JSON.stringify(body || {}));
+  return { headers: headers || {}, on(ev, cb) { if (ev === 'data') cb(buf); if (ev === 'end') cb(); return this; } };
+};
 const mkReq = (body) => {
   const buf = Buffer.from(JSON.stringify(body || {}));
   return { headers: {}, on(ev, cb) { if (ev === 'data') cb(buf); if (ev === 'end') cb(); return this; } };
@@ -50,7 +54,8 @@ for (const s of ['BTC', 'SOL', 'ETH', 'BNB', 'XRP']) {
 }
 comp.wire({
   openAlias: T.openAlias, closeAlias: T.closeAlias, scoreUser: T.scoreUser,
-  resetPlayer: T.resetPlayerAccount, epochOf: T.epochOfUser, log: () => {},
+  prepareSeat: T.prepareSeat, seatState: T.seatState, markSetFor: T.markSetFor,
+  equityOf: (uid) => { const a = T.stmt.acctGet.get(uid); return a ? T.accountRisk(uid, a).equityTotal : NaN; }, log: () => {},
 });
 
 const A = 8001, B = 8002, OUTSIDER = 8003;
@@ -164,7 +169,7 @@ const acct = (u) => T.stmt.acctGet.get(u);
     T.stmt.acctIns.run(uid, Date.now(), Date.now());
     T.db.prepare('UPDATE paper_accounts SET heat = 1, start_balance = 10, balance = 10 WHERE user_id = ?').run(uid);
     T.db.prepare('DELETE FROM paper_positions WHERE user_id = ?').run(uid);
-    const ep = T.epochOfUser(uid);
+    const ep = T.seatState_epoch(uid);
     // 1000x long, isolated, tiny margin: a 5% adverse move must liquidate it
     T.stmt.posIns.run(uid, 'BTC-BOOST', ep, 'LONG', 1, 100, 1000, Date.now(), 100, Date.now(), Date.now(), 'isolated', 0.1);
     setMark('BTC', 90);
@@ -177,7 +182,7 @@ const acct = (u) => T.stmt.acctGet.get(u);
     const uid = B;
     T.db.prepare('DELETE FROM paper_positions WHERE user_id = ?').run(uid);
     T.db.prepare('UPDATE paper_accounts SET heat = 1, start_balance = 10, balance = 10 WHERE user_id = ?').run(uid);
-    const ep = T.epochOfUser(uid);
+    const ep = T.seatState_epoch(uid);
     T.stmt.posIns.run(uid, 'SOL-HOT', ep, 'LONG', 1, 100, 1000, Date.now(), 100, Date.now(), Date.now(), 'isolated', 0.1);
     setMark('SOL', 90);
     T.tickEval('SOL', { force: true });
@@ -188,7 +193,7 @@ const acct = (u) => T.stmt.acctGet.get(u);
   console.log('\nblocker 3: resting orders cannot outlive their segment');
   await ok('closing a segment cancels orders resting on it', () => {
     T.openAlias('BTC-HOT', 'i-ord');
-    const ep = T.epochOfUser(A);
+    const ep = T.seatState_epoch(A);
     T.stmt.ordIns.run(A, ep, 'BTC-HOT', 'BUY', 50, 1, 10, 0, Date.now(), 'cross', null, null);
     assert.strictEqual(T.stmt.ordOpenBySymbol.all('BTC-HOT').length, 1, 'order should be resting');
     T.closeAlias('BTC-HOT');
@@ -200,7 +205,7 @@ const acct = (u) => T.stmt.acctGet.get(u);
        sets the WS heartbeat, so stamp it or the sweep returns before the
        guard under test is reached. */
     T.live.lastMsgMs = Date.now();
-    const ep = T.epochOfUser(A);
+    const ep = T.seatState_epoch(A);
     // slipped in behind closeAlias: the gate is shut but the order exists
     T.stmt.ordIns.run(A, ep, 'BTC-HOT', 'BUY', 50, 1, 10, 0, Date.now(), 'cross', null, null);
     assert.strictEqual(T.aliasOpen('BTC-HOT'), false, 'gate is shut');
@@ -264,7 +269,17 @@ const acct = (u) => T.stmt.acctGet.get(u);
     assert.strictEqual(b.status, 'failed', 'the boundary must be recorded as failed');
     comp.wire({ scoreUser: realScore });
   });
+  await ok('a blocked round refuses to advance until an operator clears it', () => {
+    const before = CT.q.bGet.get('i5', comp.ROUND_PLAN.round.total).ran_at;
+    CT.fireBoundary('i5', comp.ROUND_PLAN.round.total);
+    assert.notStrictEqual(CT.q.get.get('i5').status, 'done', 'still blocked, must not settle');
+    assert.strictEqual(CT.q.bGet.get('i5', comp.ROUND_PLAN.round.total).ran_at, before,
+      'a blocked round must not even re-run the boundary');
+  });
   await ok('a failed boundary can be retried once the cause is fixed', () => {
+    comp.clearBlock('i5', { note: 'test recovery' });
+    assert.strictEqual(CT.q.get.get('i5').blocked_reason, null,
+      'a successful recovery must clear the block, not leave it attached');
     CT.fireBoundary('i5', comp.ROUND_PLAN.round.total);
     const r = CT.q.get.get('i5');
     assert.strictEqual(r.status, 'done', 'the retry should settle it');
@@ -280,7 +295,7 @@ const acct = (u) => T.stmt.acctGet.get(u);
   console.log('\nblocker 6: open Hot exposure counts 2x on the live wall');
   await ok('an OPEN hot position already shows its bonus', () => {
     T.db.prepare('DELETE FROM paper_positions WHERE user_id = ?').run(A);
-    const ep = T.epochOfUser(A);
+    const ep = T.seatState_epoch(A);
     T.stmt.posIns.run(A, 'SOL-HOT', ep, 'LONG', 1, 100, 10, Date.now(), 100, Date.now(), Date.now(), 'cross', 0);
     setMark('SOL', 105);                       // +5 unrealised on the hot leg
     const s = T.scoreUser(A, 'SOL-HOT', ep);
@@ -288,7 +303,7 @@ const acct = (u) => T.stmt.acctGet.get(u);
       'the bonus must track the open leg, not wait for it to close: got ' + s.hotBonus);
   });
   await ok('closing the hot leg does not jump the score', () => {
-    const ep = T.epochOfUser(A);
+    const ep = T.seatState_epoch(A);
     const before = T.scoreUser(A, 'SOL-HOT', ep);
     const beforeScore = before.accountPnl + before.hotBonus;
     // realise it at the same mark, the way the segment close does
@@ -305,7 +320,7 @@ const acct = (u) => T.stmt.acctGet.get(u);
   await ok('a seated player cannot arm the legacy per-position clock', () => {
     comp.createRound({ id: 'i7', candidates: ['BTC', 'SOL'], players: [{ userId: A, seat: 0 }] });
     comp.startRound('i7');
-    const ep = T.epochOfUser(A);
+    const ep = T.seatState_epoch(A);
     T.applyFill(A, { symbol: 'BTC', orderSide: 'BUY', size: 0.01, px: 100, feeBps: 0, kind: 'MARKET', leverage: 500 });
     const pos = T.stmt.posGet.get(A, 'BTC');
     assert.ok(pos, 'position should exist');
@@ -346,6 +361,190 @@ const acct = (u) => T.stmt.acctGet.get(u);
     assert.strictEqual(v.traded, 'ETH');
     setMark(drawn, 100);
     comp.abortRound('i8');
+  });
+
+  console.log('\nround two: the mutation barrier covers every path');
+  await ok('closing a position after the bell is refused', async () => {
+    T.db.prepare('DELETE FROM paper_positions WHERE user_id = ?').run(A);
+    comp.createRound({ id: 'r2a', candidates: ['BTC', 'SOL'], players: [{ userId: A, seat: 0 }] });
+    comp.startRound('r2a');
+    const ep = T.seatState_epoch(A);
+    T.stmt.posIns.run(A, 'BTC', ep, 'LONG', 1, 100, 10, Date.now(), 100, Date.now(), Date.now(), 'cross', 0);
+    CT.db.prepare('UPDATE paper_rounds SET ends_at = ? WHERE id = ?').run(Date.now() - 1000, 'r2a');
+    asUser(A);
+    const res = mkRes();
+    await P.closePosition(mkReq({ symbol: 'BTC' }), res);
+    assert.strictEqual(res.code, 409, JSON.stringify(res.body));
+    assert.ok(T.stmt.posGet.get(A, 'BTC'), 'the position must be untouched');
+  });
+  await ok('adjusting margin after the bell is refused', async () => {
+    asUser(A);
+    const res = mkRes();
+    await P.adjustMargin(mkReq({ symbol: 'BTC', amount: 1 }), res);
+    assert.strictEqual(res.code, 409);
+  });
+  await ok('a blocked round also bars writes', async () => {
+    CT.db.prepare('UPDATE paper_rounds SET ends_at = ?, blocked_reason = ? WHERE id = ?')
+      .run(Date.now() + 60_000, 'test block', 'r2a');
+    assert.strictEqual(comp.writeBarrier(A), 'round_blocked');
+    CT.db.prepare('UPDATE paper_rounds SET blocked_reason = NULL WHERE id = ?').run('r2a');
+  });
+  await ok('a spectator is never barred by someone else\'s round', () => {
+    assert.strictEqual(comp.writeBarrier(OUTSIDER), null);
+  });
+
+  console.log('\nround two: phase is authoritative for segment eligibility');
+  await ok('a late hot-end leaves the ticker ineligible anyway', () => {
+    T.openAlias('BTC-HOT', 'r2a');           // gate still open, as a stuck timer would leave it
+    const r = CT.q.get.get('r2a');
+    const inOpen = r.started_at + comp.ROUND_PLAN.round.hotEnd + 60_000;   // past Hot
+    assert.strictEqual(comp.levCapFor('BTC-HOT', 1000, A, inOpen), 0,
+      'the phase must refuse it even though the gate is open');
+    T.closeAlias('BTC-HOT', { roundId: 'r2a' });
+  });
+
+  console.log('\nround two: operator actions cannot corrupt a live round');
+  await ok('resetPlayers is refused on a running round', async () => {
+    const res = mkRes();
+    await P.compAdmin(mkReqH({ action: 'resetPlayers', id: 'r2a' }, { 'x-comp-token': process.env.PAPER_COMP_TOKEN }), res);
+    assert.strictEqual(res.code, 409, JSON.stringify(res.body));
+  });
+  await ok('aborting a future armed round leaves the live round alone', () => {
+    T.openAlias('BTC-BOOST', 'r2a');
+    comp.createRound({ id: 'r2b', candidates: ['BTC', 'SOL'], players: [{ userId: B, seat: 0 }] });
+    comp.abortRound('r2b');
+    assert.strictEqual(T.aliasOpen('BTC-BOOST'), true,
+      'the live round\'s Boost ticker must survive an unrelated abort');
+    T.closeAlias('BTC-BOOST', { roundId: 'r2a' });
+  });
+  await ok('a non-owner cannot close another round\'s alias', () => {
+    T.openAlias('BTC-BOOST', 'r2a');
+    const res = T.closeAlias('BTC-BOOST', { roundId: 'someone-else' });
+    assert.strictEqual(res.skipped, 'not_owner');
+    assert.strictEqual(T.aliasOpen('BTC-BOOST'), true);
+    T.closeAlias('BTC-BOOST', { roundId: 'r2a' });
+  });
+
+  console.log('\nround two: restart recovery');
+  await ok('a boundary left running by a dead process becomes retryable', () => {
+    CT.q.bMark.run('r2a', comp.ROUND_PLAN.round.firstFive, 'running', null, Date.now() - 60_000);
+    CT.db.prepare('UPDATE paper_rounds SET ends_at = ? WHERE id = ?').run(Date.now() + 600_000, 'r2a');
+    comp.resume();
+    const b = CT.q.bGet.get('r2a', comp.ROUND_PLAN.round.firstFive);
+    assert.notStrictEqual(b.status, 'running', 'a stale lease must not block forever');
+  });
+  await ok('a restart that missed a boundary blocks instead of continuing', () => {
+    // wind the clock so First Five is in the past and unrun
+    CT.db.prepare('UPDATE paper_rounds SET started_at = ?, blocked_reason = NULL WHERE id = ?')
+      .run(Date.now() - 10 * 60_000, 'r2a');
+    CT.db.prepare('DELETE FROM paper_round_boundaries WHERE round_id = ?').run('r2a');
+    comp.resume();
+    assert.match(CT.q.get.get('r2a').blocked_reason || '', /missed/,
+      'a show that did not happen must not be resumed as if it had');
+  });
+  await ok('gates are rebuilt from durable state, not from replaying boundaries', () => {
+    comp.clearBlock('r2a');
+    const r = CT.q.get.get('r2a');
+    CT.q.setDraw.run('BTC', 'seed', Date.now(), Date.now(), 'r2a');
+    CT.q.setActive.run('BTC', null, Date.now(), 'r2a');
+    // sit the clock inside the Hot window, with the gate wrongly closed
+    CT.db.prepare('UPDATE paper_rounds SET started_at = ? WHERE id = ?')
+      .run(Date.now() - (comp.ROUND_PLAN.round.hotStart + 30_000), 'r2a');
+    T.closeAlias('BTC-HOT', { roundId: 'r2a' });
+    assert.strictEqual(T.aliasOpen('BTC-HOT'), false);
+    comp.rehydrateGates(CT.q.get.get('r2a'));
+    assert.strictEqual(T.aliasOpen('BTC-HOT'), true,
+      'a restart mid-Hot must reopen the ticker its phase says is live');
+    T.closeAlias('BTC-HOT', { roundId: 'r2a' });
+    comp.abortRound('r2a');
+  });
+
+  console.log('\nround two: Hot close is canonical and fail-closed');
+  await ok('settlement refuses to run without a fresh mark', () => {
+    T.openAlias('SOL-HOT', 'r2c');
+    const ep = T.seatState_epoch(A);
+    T.stmt.posIns.run(A, 'SOL-HOT', ep, 'LONG', 1, 100, 10, Date.now(), 100, Date.now(), Date.now(), 'cross', 0);
+    const saved = T.live.map.get('SOL');
+    T.live.map.delete('SOL');
+    assert.throws(() => T.closeAlias('SOL-HOT', { roundId: 'r2c' }), /no fresh mark/,
+      'a missing mark must fail the segment, not silently leave someone open');
+    assert.ok(T.stmt.posGet.get(A, 'SOL-HOT'), 'and the position is still there to settle later');
+    T.live.map.set('SOL', saved);
+    T.closeAlias('SOL-HOT', { roundId: 'r2c' });
+    assert.strictEqual(T.stmt.posGet.get(A, 'SOL-HOT'), undefined, 'settles once the mark returns');
+  });
+
+  console.log('\nround two: the final mark is the SCHEDULED one');
+  await ok('a mark history answers "what was the price at time T"', () => {
+    const t0 = Date.now();
+    T.recordMark('BTC', 100, t0 - 5000);
+    T.recordMark('BTC', 110, t0 - 1000);
+    assert.strictEqual(T.markAt('BTC', t0 - 3000), 100, 'must return the mark at or before T');
+    assert.strictEqual(T.markAt('BTC', t0), 110);
+  });
+  await ok('a late bell does not let a post-bell move into the result', () => {
+    T.db.prepare('DELETE FROM paper_positions WHERE user_id = ?').run(A);
+    comp.createRound({ id: 'r2t', candidates: ['BTC', 'SOL'], players: [{ userId: A, seat: 0 }] });
+    comp.startRound('r2t');
+    const ep = T.seatState_epoch(A);
+    T.stmt.posIns.run(A, 'BTC', ep, 'LONG', 1, 100, 10, Date.now(), 100, Date.now(), Date.now(), 'cross', 0);
+
+    const due = Date.now() - 4000;             // the bell was due 4s ago
+    T.recordMark('BTC', 100, due - 500);       // price at the bell
+    setMark('BTC', 140);                        // then it ran away before the callback
+    T.recordMark('BTC', 140, Date.now());
+
+    comp.snapshot('r2t', 'final', due);
+    const row = comp.standings('r2t', 'final')[0];
+    // 1 unit long from 100: at the bell that is +0, at callback time +40
+    assert.ok(Math.abs(row.account_pnl) < 1e-6,
+      `the result used the callback price, not the bell price: pnl ${row.account_pnl}`);
+    assert.strictEqual(row.scheduled_at, due, 'the scheduled instant must be recorded');
+  });
+  await ok('the exact marks used are stored for replay', () => {
+    const row = comp.standings('r2t', 'final')[0];
+    const m = JSON.parse(row.marks || '{}');
+    assert.strictEqual(m.BTC, 100, 'the stored mark set must be the one the result came from');
+    comp.abortRound('r2t');
+    setMark('BTC', 100);
+  });
+
+  console.log('\nround two: drawdown, auth and the audit trail');
+  await ok('drawdown is measured, so the published tie-break can be applied', () => {
+    T.db.prepare('DELETE FROM paper_positions WHERE user_id IN (?, ?)').run(A, B);
+    comp.createRound({
+      id: 'r2d', candidates: ['BTC', 'SOL'],
+      players: [{ userId: A, displayName: 'A', seat: 0 }, { userId: B, displayName: 'B', seat: 1 }],
+    });
+    comp.startRound('r2d');
+    /* Both finish level, but A dipped on the way and B did not. The first
+       sample has to happen at the HIGH point, otherwise the peak is set at
+       the bottom and no drawdown is ever recorded. */
+    comp.sampleDrawdown();                                   // peak: both at 10
+    T.db.prepare('UPDATE paper_accounts SET balance = 6 WHERE user_id = ?').run(A);
+    comp.sampleDrawdown();                                   // A falls to 6
+    T.db.prepare('UPDATE paper_accounts SET balance = 10 WHERE user_id = ?').run(A);
+    comp.sampleDrawdown();                                   // and recovers
+    const rows = comp.playersOf('r2d');
+    const a = rows.find((x) => x.user_id === A);
+    assert.ok(a.max_drawdown > 0, 'the dip must be recorded, got ' + a.max_drawdown);
+    const b = rows.find((x) => x.user_id === B);
+    assert.ok(!(b.max_drawdown > 0), 'a seat that never fell has no drawdown');
+  });
+  await ok('a tie on score is broken by the SHALLOWER drawdown', () => {
+    comp.snapshot('r2d', 'final');
+    const board = comp.standings('r2d', 'final');
+    assert.strictEqual(board.length, 2);
+    assert.ok(Math.abs(board[0].score - board[1].score) < 1e-9, 'scores should be level for this case');
+    assert.strictEqual(board[0].user_id, B, 'the steadier trader should win the tie');
+    assert.ok(board[0].maxDrawdown <= board[1].maxDrawdown);
+    comp.abortRound('r2d');
+  });
+  await ok('operator actions are written to an audit trail', () => {
+    const rows = T.db.prepare("SELECT * FROM paper_operator_log ORDER BY id DESC LIMIT 20").all();
+    assert.ok(rows.length, 'operator actions must leave a record');
+    assert.ok(rows.some((r) => r.action === 'resetPlayers' && r.ok === 0),
+      'a refused action must be recorded too, not only successful ones');
   });
 
   console.log(`\n${pass} passed${process.exitCode ? ', WITH FAILURES' : ''}\n`);

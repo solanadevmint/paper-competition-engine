@@ -37,7 +37,8 @@ T.mktCfg.set('SOL', { ...T.mktCfg.get('BTC') });
 const logs = [];
 comp.wire({
   openAlias: T.openAlias, closeAlias: T.closeAlias, scoreUser: T.scoreUser,
-  resetPlayer: T.resetPlayerAccount, epochOf: T.epochOfUser,
+  prepareSeat: T.prepareSeat, seatState: T.seatState, markSetFor: T.markSetFor,
+  equityOf: (uid) => { const a = T.stmt.acctGet.get(uid); return a ? T.accountRisk(uid, a).equityTotal : NaN; },
   log: (m) => logs.push(m),
 });
 /* These rounds start with prepare:false. The suite writes fills by hand to
