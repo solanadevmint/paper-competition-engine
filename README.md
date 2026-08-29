@@ -60,9 +60,10 @@ position accounting. A separate ticker gives event exposure its own entry,
 size and PnL for free.
 
 *Known consequence:* a trader can hold `SOL-HOT` long and `SOL` short
-simultaneously. We concluded this is not exploitable — hedging halves your
-upside rather than creating free money, since the base leg cancels the account
-PnL that the bonus would otherwise double. **Worth a second opinion.**
+simultaneously. An earlier version of this README called that "not
+exploitable", which was wrong and was corrected in review. See **Open product
+decision** below: there is no free money, but it is a valid low-risk
+score-only strategy and it needs an owner's call.
 
 **Boost twins are forced isolated-margin** (`cfgOf()`). At 1000x the
 liquidation distance is ~5bps. Measured index-noise breach rates over a
@@ -74,8 +75,14 @@ the Boost rather than ending the player's round.
 when the round is armed; the seed is published at the reveal. Anyone can
 recompute the winner. The commitment covers the candidate list too, so the
 shortlist cannot be swapped after the fact either. The seed is held in memory
-until the reveal and a restart in between fails loudly rather than drawing
-from an uncommitted seed. See `verifyDraw()`.
+until the reveal, and a restart in between now blocks the round rather than
+falling through to the backup. See `verifyDraw()`.
+
+*Scope of the proof:* commit-reveal shows the result was not changed after the
+commitment. It does not show the seed was not chosen before it. If the public
+claim needs to be "nobody could influence it", combine the commitment with
+future external entropy (a block hash at an announced height); otherwise
+describe it narrowly.
 
 **Phases fire from a server timer anchored to the round start**, never from a
 client poll. Boundaries already past are replayed in order on boot, and each
