@@ -1,0 +1,18 @@
+[Unit]
+Description=Phoenix paper trading engine (isolated)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/opt/phoenix-paper
+EnvironmentFile=/etc/phoenix-paper.env
+ExecStart=/usr/bin/node /opt/phoenix-paper/server.js
+Restart=always
+RestartSec=5
+# The engine is small by design; a leak should recycle the service, not the box.
+MemoryMax=1200M
+
+[Install]
+WantedBy=multi-user.target

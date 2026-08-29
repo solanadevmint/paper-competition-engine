@@ -1,0 +1,11 @@
+{
+  "name": "phoenix-paper",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Isolated paper trading engine for perp.so (/paper, /ftpaper)",
+  "main": "server.js",
+  "dependencies": {
+    "better-sqlite3": "^11.3.0",
+    "ws": "^8.18.0"
+  }
+}
