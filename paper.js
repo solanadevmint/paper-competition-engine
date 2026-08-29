@@ -2739,4 +2739,4 @@ function sweep() {
 module.exports = { init, sweep, account, comp, compState, compVerify, compAdmin, guestSession, stageCandles, placeOrder, cancelOrder, closePosition, setSltp, adjustMargin, reset, fills, ordersHistory, leaderboard, engineConfig, marketTape, pythHistory, pythStream, attachIndexWs };
 // Internal handles for the test harness / FT port test suite. Read-mostly;
 // requiring the module does not start the WS or any timers (that is init's job).
-module.exports.__test = { prints, live, mktCfg, stmt, db, sweep, tickEval, scoreUser, accountRisk, baseOf, aliasKind, aliasOpen, openAliases, openAlias, closeAlias, cfgOf, stageLevCap, mkt, ingestPrint, printedVolumeThrough, books, writeRate: _writeRate, guardCheck, comps: _idxComps, halt: _halt, ingestIndexTick, compUpdate };
+module.exports.__test = { prints, live, mktCfg, stmt, db, sweep, tickEval, scoreUser, accountRisk, liqEstimate, baseOf, aliasKind, aliasOpen, openAliases, openAlias, closeAlias, cfgOf, stageLevCap, mkt, ingestPrint, printedVolumeThrough, books, writeRate: _writeRate, guardCheck, comps: _idxComps, halt: _halt, ingestIndexTick, compUpdate };
