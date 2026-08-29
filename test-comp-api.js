@@ -135,6 +135,24 @@ for (const uid of SEATS) {
     assert.ok(st.drawCommit, 'and the commitment is published up front');
   });
   ok('boost is not open in the opening phase', () => assert.strictEqual(st.boostOpen, false));
+  ok('the wall is told what each trader is holding', () => {
+    // the show has to answer "what is she trading" without narration
+    for (const p of st.players ?? []) {
+      assert.ok(Array.isArray(p.positions), 'positions must always be an array');
+    }
+  });
+  ok('a held position surfaces on the wall with its side and size', async () => {
+    T.stmt.posIns.run(SEATS[0], 'BTC', T.stmt.acctGet.get(SEATS[0]).epoch,
+      'SHORT', 1, 100, 25, Date.now(), 100, Date.now(), Date.now(), 'cross', 0);
+    const row = state().players.find((p) => p.userId === SEATS[0]);
+    const pos = row.positions.find((x) => x.symbol === 'BTC');
+    assert.ok(pos, 'the position should be visible');
+    assert.strictEqual(pos.side, 'short');
+    assert.strictEqual(pos.leverage, 25);
+    assert.ok(pos.notional > 0, 'notional must be priced at the mark');
+    assert.strictEqual(pos.segment, null, 'a base ticker is not a segment');
+    T.db.prepare('DELETE FROM paper_positions WHERE user_id = ? AND symbol = ?').run(SEATS[0], 'BTC');
+  });
 
   console.log('\ndraw and segments');
   warpTo('e2e', ROUND_PLAN.round.reveal + 1000);

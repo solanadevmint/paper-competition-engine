@@ -1538,9 +1538,26 @@ function compState(req, res) {
   const players = comp.playersOf(r.id).map((pl) => {
     let s = { equity: 0, accountPnl: 0, realized: 0, hotBonus: 0 };
     try { s = scoreUser(pl.user_id, drawn ? r.hot_base + '-HOT' : null); } catch {}
+    /* What they are holding, biggest first. The wall has to answer "what is
+       she actually trading" without the operator narrating it, and a rank
+       with no position behind it is the least interesting thing on a screen.
+       Positions are public in this format by design. */
+    const positions = stmt.posByUser.all(pl.user_id).map((p) => {
+      const mk = posMarkOf(p);
+      return {
+        entry: r6(p.entry_price),
+        leverage: p.leverage,
+        mark: r6(mk),
+        notional: r6(p.size * mk),
+        segment: aliasKind(p.symbol),           // HOT | BOOST | null
+        side: p.side === 'LONG' ? 'long' : 'short',
+        symbol: p.symbol,
+        upnl: r6(uPnl(p, mk)),
+      };
+    }).sort((a, b) => b.notional - a.notional);
     return {
       userId: pl.user_id, name: pl.display_name, seat: pl.seat,
-      ...s, score: r6(s.accountPnl + s.hotBonus),
+      ...s, score: r6(s.accountPnl + s.hotBonus), positions,
     };
   }).sort((a, b) => b.score - a.score || b.realized - a.realized || a.seat - b.seat)
     .map((x, i) => ({ ...x, rank: i + 1 }));
