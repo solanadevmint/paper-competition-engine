@@ -232,6 +232,14 @@ const stmt = {
   fillIns:    db.prepare(`INSERT INTO paper_fills (user_id, epoch, symbol, side, kind, price, size, notional, fee, realized_pnl, order_id, ts, bad_debt)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`),
   posBySymbol: db.prepare('SELECT * FROM paper_positions WHERE symbol = ?'),
+  /* A base tick has to reach the aliases that price off it. Alias positions
+     are stored under their own symbol, so an exact match on 'BTC' never sees
+     'BTC-BOOST' — which at 1000x meant a 5bps liquidation distance was only
+     checked by the 5s sweep. Both twins are listed explicitly rather than
+     pattern-matched, so the index is still used. */
+  posBySymbolTree: db.prepare('SELECT * FROM paper_positions WHERE symbol IN (?, ?, ?)'),
+  ordOpenBySymbol: db.prepare("SELECT * FROM paper_orders WHERE symbol = ? AND status = 'OPEN'"),
+  ordCancelSymbol: db.prepare("UPDATE paper_orders SET status = 'CANCELLED', closed_at = ? WHERE symbol = ? AND status = 'OPEN'"),
   fillList:   db.prepare('SELECT * FROM paper_fills WHERE user_id = ? AND epoch = ? AND id < ? ORDER BY id DESC LIMIT ?'),
   fillListAll: db.prepare('SELECT * FROM paper_fills WHERE user_id = ? AND id < ? ORDER BY id DESC LIMIT ?'),
   fillListTrades:  db.prepare("SELECT * FROM paper_fills WHERE user_id = ? AND epoch = ? AND kind != 'FUNDING' AND id < ? ORDER BY id DESC LIMIT ?"),
@@ -1174,7 +1182,11 @@ function init({ apiGet, warehouseGet, log, readRateOk } = {}) {
   // Hand the competition clock its controls, then pick up any round the
   // engine was running when it restarted: a mid-show reboot must resume the
   // same schedule rather than stall the wall on a phase that never ends.
-  comp.wire({ openAlias, closeAlias, scoreUser, log: (m) => _log(m) });
+  comp.wire({
+    openAlias, closeAlias, scoreUser,
+    resetPlayer: resetPlayerAccount, epochOf: epochOfUser,
+    log: (m) => _log(m),
+  });
   try { comp.resume(); } catch (e) { _log('competition resume failed: ' + e.message); }
   if (readRateOk) _readRateOk = readRateOk;
   refreshExchange().catch(() => {});
@@ -1391,6 +1403,21 @@ function liqEstimate(pos, positions, balance, heat = false) {
 // guarantee holds on EVERY close path (SL/TP/DELIST/liquidation/manual): a
 // negative close credit is floored at 0 — loss never exceeds the allocated
 // margin, the excess is absorbed as bad debt, Phoenix-style.
+/* The legacy per-position Boost clock belongs to the PUBLIC paper product: a
+   >100x fill there starts a 2:00 timer and auto-settles. It must never touch
+   a competition player, for two reasons. The show's Boost is a shared phase
+   controlled by the round clock, so a second, per-position timer would settle
+   positions mid-window; and the opt-out is a client-supplied flag, which
+   would let two otherwise identical competitors be treated differently based
+   on what their browser sent. Inside a round the server decides, and the
+   answer is always "no legacy clock". */
+function armsLegacyBoost(userId, symbol, lev, boostWindow, acct) {
+  if (lev < BOOST_ARM_LEV || !isStage(acct.heat)) return false;
+  if (aliasKind(symbol)) return false;              // event tickers are phase-gated
+  if (comp.accountLocked(userId)) return false;     // seated competitor
+  return boostWindow;
+}
+
 function applyFill(userId, { symbol, orderSide, size, px, feeBps, kind, orderId = null, leverage = null, marginMode = 'cross', boostWindow = true }) {
   const now = Date.now();
   const acct = ensureAccount(userId);
@@ -1413,7 +1440,7 @@ function applyFill(userId, { symbol, orderSide, size, px, feeBps, kind, orderId 
     stmt.posIns.run(userId, symbol, acct.epoch, d === 1 ? 'LONG' : 'SHORT', size, px, leverage || 1, now, px, now, now, mode, isoMargin);
     // Boost window arms on the FILL leverage, not the blended position
     // leverage — diluting a 1000x add with a small base can't dodge the clock
-    if ((leverage || 1) >= BOOST_ARM_LEV && boostWindow && isStage(acct.heat)) stmt.posBoostStamp.run(now, userId, symbol);
+    if (armsLegacyBoost(userId, symbol, leverage || 1, boostWindow, acct)) stmt.posBoostStamp.run(now, userId, symbol);
   } else if (dirOf(pos.side) === d) {
     const newSize = r6(pos.size + size);
     const entry = r6((pos.size * pos.entry_price + size * px) / newSize);
@@ -1427,7 +1454,7 @@ function applyFill(userId, { symbol, orderSide, size, px, feeBps, kind, orderId 
       balance = r6(balance - addMargin);
     }
     stmt.posUpd.run(newSize, entry, newLev, pos.realized_pnl, isoMargin, now, userId, symbol);
-    if (addLev >= BOOST_ARM_LEV && boostWindow && isStage(acct.heat)) stmt.posBoostStamp.run(now, userId, symbol);
+    if (armsLegacyBoost(userId, symbol, addLev, boostWindow, acct)) stmt.posBoostStamp.run(now, userId, symbol);
   } else {
     const closeSz = Math.min(size, pos.size);
     realized = r6(closeSz * (px - pos.entry_price) * dirOf(pos.side));
@@ -1506,17 +1533,47 @@ const compRealized = db.prepare(
 const compHot = db.prepare(
   "SELECT COALESCE(SUM(realized_pnl), 0) AS v FROM paper_fills WHERE user_id = ? AND epoch = ? AND symbol = ? AND realized_pnl IS NOT NULL"
 );
-function scoreUser(userId, hotTicker) {
+function scoreUser(userId, hotTicker, epoch = null) {
   const acct = ensureAccount(userId);
   const risk = accountRisk(userId, acct);
   const start = acct.start_balance || START_BALANCE;
+  /* Score the epoch the ROUND bound at its start, not whatever the account
+     happens to be on now. If anything bumps the epoch mid-round, the result
+     must not silently change basis underneath it. */
+  const ep = Number.isFinite(epoch) ? epoch : acct.epoch;
   return {
     equity: r6(risk.equityTotal),
     accountPnl: r6(risk.equityTotal - start),
-    realized: r6(compRealized.get(userId, acct.epoch).v),
-    hotBonus: hotTicker ? r6(compHot.get(userId, acct.epoch, hotTicker).v) : 0,
+    realized: r6(compRealized.get(userId, ep).v),
+    /* Realised Hot PnL plus whatever the open Hot leg is worth right now.
+       Counting only realised fills made the wall show 1x during the segment
+       and jump to 2x the instant the ticker force-closed, so every projected
+       ranking inside the window was wrong. Because the segment closes into
+       realised PnL, this transitions continuously rather than stepping. */
+    hotBonus: hotTicker ? r6(compHot.get(userId, ep, hotTicker).v + openHotPnl(userId, hotTicker)) : 0,
   };
 }
+
+/* Mark-to-market value of an open position on the Hot ticker, 0 if flat. */
+function openHotPnl(userId, hotTicker) {
+  const p = stmt.posGet.get(userId, hotTicker);
+  if (!p) return 0;
+  const mk = posMarkOf(p);
+  return Number.isFinite(mk) && mk > 0 ? uPnl(p, mk) : 0;
+}
+
+/* Operator-side account preparation, used by startRound so that resetting a
+   roster is part of going live rather than a button someone must remember.
+   Returns the account's NEW epoch so the round can bind its scoring basis. */
+function resetPlayerAccount(userId) {
+  const now = Date.now();
+  ensureAccount(userId);
+  db.prepare('DELETE FROM paper_positions WHERE user_id = ?').run(userId);
+  db.prepare("DELETE FROM paper_orders WHERE user_id = ? AND status = 'OPEN'").run(userId);
+  stmt.acctReset.run(now, now, userId);
+  return stmt.acctGet.get(userId).epoch;
+}
+const epochOfUser = (userId) => (stmt.acctGet.get(userId) || {}).epoch;
 
 // ── competition HTTP surface ─────────────────────────────────────────────
 /* Operator actions carry their own token on top of the nginx gate: the gate
@@ -1535,6 +1592,7 @@ function compState(req, res) {
   if (!p) return send(res, 200, { ok: true, live: false });
   const r = p.round;
   const drawn = !!r.draw_at;
+  const activeHot = r.active_hot_base || r.hot_base;
   const players = comp.playersOf(r.id).map((pl) => {
     let s = { equity: 0, accountPnl: 0, realized: 0, hotBonus: 0 };
     try { s = scoreUser(pl.user_id, drawn ? r.hot_base + '-HOT' : null); } catch {}
@@ -1567,7 +1625,11 @@ function compState(req, res) {
     phase: p.phase,
     phaseEndsAt: r.started_at + p.endsAt,
     leftMs: Math.max(0, r.ends_at - Date.now()),
-    hot: drawn ? { market: r.hot_base, ticker: r.hot_base + '-HOT', open: aliasOpen(r.hot_base + '-HOT') } : null,
+    hot: drawn ? {
+      market: activeHot, ticker: activeHot + '-HOT', open: aliasOpen(activeHot + '-HOT'),
+      // disclosed, never hidden: the drawn market and why it was replaced
+      drawn: r.hot_base, fellBack: activeHot !== r.hot_base, fallbackReason: r.fallback_reason || null,
+    } : null,
     candidates: JSON.parse(r.hot_candidates),
     drawCommit: r.draw_commit,
     // Report the GATE, not the clock. The order path accepts a boost only if
@@ -1602,7 +1664,10 @@ async function compAdmin(req, res) {
     if (a === 'create') {
       return send(res, 200, { ok: true, round: comp.createRound(body) });
     }
-    if (a === 'start') return send(res, 200, { ok: true, round: comp.startRound(body.id) });
+    if (a === 'start') {
+      // prepare:false only for a rehearsal that deliberately keeps balances
+      return send(res, 200, { ok: true, round: comp.startRound(body.id, { prepare: body.prepare !== false }) });
+    }
     if (a === 'abort') return send(res, 200, { ok: true, round: comp.abortRound(body.id) });
     if (a === 'standings') {
       return send(res, 200, { ok: true, board: comp.standings(body.id, body.checkpoint || 'final') });
@@ -1670,6 +1735,15 @@ function openAlias(alias, roundId = null) {
 // segment bonus is simply what got realised, with no snapshot to reconcile.
 function closeAlias(alias, { flatten = true } = {}) {
   openAliases.delete(alias);
+  /* Cancel anything resting on the ticker BEFORE settling it. A limit order
+     left open on a closed segment would fill later and reopen exposure the
+     segment had already scored and shut. Cancellation happens even when we
+     are not flattening (the bell), because the gate is shut either way. */
+  const resting = stmt.ordOpenBySymbol.all(alias);
+  if (resting.length) {
+    stmt.ordCancelSymbol.run(Date.now(), alias);
+    _log(`alias close ${alias}: cancelled ${resting.length} resting order(s)`);
+  }
   // Shutting the gate and flattening are DIFFERENT acts. The Hot segment ends
   // by flattening, because its bonus is what got realised. The bell ends by
   // marking: positions stay exactly where they are and the final snapshot
@@ -1754,7 +1828,10 @@ function tickEval(symbol, { force = false } = {}) {
   // chart cannot show a crossing the engine did not act on. The query is a
   // prepared statement on an indexed column; the expensive transaction below
   // still only runs when positions exist.
-  const ps = stmt.posBySymbol.all(symbol);
+  /* Evaluate the base AND its event twins from this one incoming mark, so a
+     boosted position is risk-checked on the same tick as the market it
+     tracks rather than waiting for the sweep. */
+  const ps = stmt.posBySymbolTree.all(symbol, symbol + '-HOT', symbol + '-BOOST');
   if (!ps.length) {
     if (!force && now - (_lastTickEval.get(symbol) || 0) < TICK_EVAL_MIN_MS) return;
     _lastTickEval.set(symbol, now); return;
@@ -2023,8 +2100,27 @@ async function placeOrder(req, res) {
 
   const marketable = type === 'MARKET' || (side === 'BUY' ? mark <= price : mark >= price);
   // taker fills walk the LIVE book: warm the symbol's L2 before any account
-  // reads (the await may yield the event loop, so all DB state is read after)
-  if (marketable) await awaitBook(symbol);
+  // reads (the await may yield the event loop, so all DB state is read after).
+  // Stage fills execute at the oracle mark and never consult the book, so the
+  // yield buys nothing there and only widens the window in which a phase
+  // boundary can pass underneath an in-flight order.
+  if (marketable && !isStage(acctH.heat)) await awaitBook(symbol);
+
+  /* Re-check the competition gate AFTER any yield. Everything above was
+     decided against a phase that may no longer be current: a Hot order can
+     start while Hot is open and land after it closed, and an order can start
+     before the bell and land after the result was frozen. The gate is cheap;
+     a fill that reopens a settled segment is not. */
+  if (aliasKind(symbol) && !aliasOpen(symbol)) {
+    return send(res, 400, { ok: false, error: 'market_closed' });
+  }
+  const levCap2 = comp.levCapFor(symbol, engineCap, u.id);
+  if (!(levCap2 > 0)) return send(res, 400, { ok: false, error: 'market_closed' });
+  if (leverage > levCap2) leverage = levCap2;
+  // A round that ended during the yield must not accept another write.
+  if (comp.settledFor(u.id)) {
+    return send(res, 409, { ok: false, error: 'round_settled' });
+  }
   const mark2 = markOfFreshFor(symbol, isStage(acctH.heat)) ?? mark;   // refresh after the await
   const acct = ensureAccount(u.id);
   const risk = accountRisk(u.id, acct);
@@ -2260,11 +2356,22 @@ async function setSltp(req, res) {
 // POST /api/paper/reset
 async function reset(req, res) {
   const u = await sessionUser(req); if (!u) return send(res, 401, { ok: false, error: 'not_signed_in' });
+  /* A seated competitor does not own their own account. Without this a player
+     who blows up at minute 20 can restore the full bankroll and keep trading,
+     and the epoch bump would move the scoring basis under a live result.
+     Locked from the moment they are seated on an armed round until it ends;
+     the operator resets them as part of starting the round. */
+  if (comp.accountLocked(u.id)) {
+    return send(res, 409, { ok: false, error: 'in_competition_round' });
+  }
   const acct = ensureAccount(u.id);
   const now = Date.now();
   // mode switch: 'heat' = FT stage config ($10 real bankroll, display-scaled,
   // no fees/funding, fractional lots); 'scaled' = venue economics on the $10
   // micro bankroll; 'standard' restores the $10k account.
+  // (bodyRaw was never assigned here: mode switching via this endpoint has
+  // silently never worked. Read the body before parsing it.)
+  const bodyRaw = await readBody(req);
   let mode = null;
   try { mode = (JSON.parse(bodyRaw || '{}').mode) || null; } catch {}
   // cooldown guards the PUBLIC leaderboard against reset-spam — it only
@@ -2649,6 +2756,14 @@ function sweep() {
       // 1) resting limit orders
       for (const o of stmt.ordOpenAll.all()) {
         try {
+          /* An order on a closed event ticker must never fill, whatever put
+             it there. closeAlias cancels on the way out; this is the
+             independent check, so a segment that ended during a crash or an
+             order that slipped in cannot resurrect scored exposure. */
+          if (aliasKind(o.symbol) && !aliasOpen(o.symbol)) {
+            stmt.ordClose.run('CANCELLED', now, o.id);
+            continue;
+          }
           const m = mkt(o.symbol);
           if (!mktFresh(m)) {
             const quiet = m ? now - (m.lastUpdatedMs || 0) : Infinity;
@@ -2756,4 +2871,4 @@ function sweep() {
 module.exports = { init, sweep, account, comp, compState, compVerify, compAdmin, guestSession, stageCandles, placeOrder, cancelOrder, closePosition, setSltp, adjustMargin, reset, fills, ordersHistory, leaderboard, engineConfig, marketTape, pythHistory, pythStream, attachIndexWs };
 // Internal handles for the test harness / FT port test suite. Read-mostly;
 // requiring the module does not start the WS or any timers (that is init's job).
-module.exports.__test = { prints, live, mktCfg, stmt, db, sweep, tickEval, scoreUser, accountRisk, liqEstimate, baseOf, aliasKind, aliasOpen, openAliases, openAlias, closeAlias, cfgOf, stageLevCap, mkt, ingestPrint, printedVolumeThrough, books, writeRate: _writeRate, guardCheck, comps: _idxComps, halt: _halt, ingestIndexTick, compUpdate };
+module.exports.__test = { prints, live, mktCfg, stmt, db, sweep, tickEval, applyFill, openAlias, closeAlias, aliasOpen: (s) => aliasOpen(s), scoreUser, accountRisk, liqEstimate, resetPlayerAccount, epochOfUser, baseOf, aliasKind, aliasOpen, openAliases, openAlias, closeAlias, cfgOf, stageLevCap, mkt, ingestPrint, printedVolumeThrough, books, writeRate: _writeRate, guardCheck, comps: _idxComps, halt: _halt, ingestIndexTick, compUpdate };

@@ -35,7 +35,15 @@ T.mktCfg.set('BTC', { tiers: [], maxLev: 40, lotSize: null, takerBps: 3.5, maker
 T.mktCfg.set('SOL', { ...T.mktCfg.get('BTC') });
 
 const logs = [];
-comp.wire({ openAlias: T.openAlias, closeAlias: T.closeAlias, scoreUser: T.scoreUser, log: (m) => logs.push(m) });
+comp.wire({
+  openAlias: T.openAlias, closeAlias: T.closeAlias, scoreUser: T.scoreUser,
+  resetPlayer: T.resetPlayerAccount, epochOf: T.epochOfUser,
+  log: (m) => logs.push(m),
+});
+/* These rounds start with prepare:false. The suite writes fills by hand to
+   set up each scoring case, and a real reset would wipe exactly the state
+   under test. Preparation itself is covered in test-comp-api. */
+const start = (id) => comp.startRound(id, { prepare: false });
 
 // ── two players on a stage-mode account ──────────────────────────────────
 const MIA = 5001, ALEX = 5002;
@@ -108,7 +116,7 @@ ok('a snapshot writes one row per player and ranks them', () => {
     id: 'r-score', candidates: ['SOL', 'BTC'],
     players: [{ userId: MIA, displayName: 'Mia' }, { userId: ALEX, displayName: 'Alex' }],
   });
-  comp.startRound('r-score');
+  start('r-score');
   CT.q.setDraw.run('SOL', null, null, Date.now(), 'r-score');   // pretend SOL was drawn
   comp.snapshot('r-score', 'firstFive');
   const board = comp.standings('r-score', 'firstFive');
@@ -137,12 +145,20 @@ ok('a positive leader wins the heat prize', () => {
   assert.ok(res.winner, 'expected a winner');
   assert.strictEqual(res.winner.display_name, 'Mia');
 });
+/* Only one round may be live at a time now, so each case ends its round
+   before the next begins. That constraint is itself asserted below. */
+ok('a second round cannot start while one is running', () => {
+  comp.createRound({ id: 'r-clash', candidates: ['SOL', 'BTC'], players: [{ userId: MIA }] });
+  assert.throws(() => start('r-clash'), /already running/);
+  comp.abortRound('r-clash');
+});
 ok('an all-negative heat rolls the prize over', () => {
+  comp.abortRound('r-score');
   const A = 6001, B = 6002;
   mkPlayer(A); mkPlayer(B);
   realisedFill(A, 'BTC', -2); realisedFill(B, 'BTC', -5);
   comp.createRound({ id: 'r-red', candidates: ['SOL', 'BTC'], players: [{ userId: A }, { userId: B }] });
-  comp.startRound('r-red');
+  start('r-red');
   comp.snapshot('r-red', 'firstFive');
   const res = comp.firstFiveResult('r-red');
   assert.strictEqual(res.winner, null, 'nobody positive: nothing should be paid');
@@ -154,7 +170,7 @@ ok('the final always pays, even when everyone is red', () => {
   mkPlayer(A); mkPlayer(B);
   realisedFill(A, 'BTC', -2); realisedFill(B, 'BTC', -5);
   comp.createRound({ id: 'r-final', kind: 'final', candidates: ['SOL', 'BTC'], players: [{ userId: A }, { userId: B }] });
-  comp.startRound('r-final');
+  start('r-final');
   comp.snapshot('r-final', 'firstFive');
   const res = comp.firstFiveResult('r-final');
   assert.ok(res.winner, 'the main stage must not have an unclaimed prize');
@@ -164,10 +180,15 @@ ok('the final always pays, even when everyone is red', () => {
 
 console.log('\nthe bell');
 ok('the bell freezes a final checkpoint without closing positions', () => {
+  comp.createRound({
+    id: 'r-bell', candidates: ['SOL', 'BTC'],
+    players: [{ userId: MIA, displayName: 'Mia' }, { userId: ALEX, displayName: 'Alex' }],
+  });
+  start('r-bell');
   const openBefore = T.stmt.posByUser.all(ALEX).length;
-  CT.fireBoundary('r-score', ROUND_PLAN.round.total);
-  assert.strictEqual(CT.q.get.get('r-score').status, 'done');
-  const board = comp.standings('r-score', 'final');
+  CT.fireBoundary('r-bell', ROUND_PLAN.round.total);
+  assert.strictEqual(CT.q.get.get('r-bell').status, 'done');
+  const board = comp.standings('r-bell', 'final');
   assert.strictEqual(board.length, 2, 'every player must be marked');
   assert.strictEqual(T.stmt.posByUser.all(ALEX).length, openBefore,
     'positions are marked where they stand, never force-closed');

@@ -34,7 +34,16 @@ for (const s of ['BTC', 'SOL', 'ETH', 'BNB', 'XRP']) {
   T.live.map.set(s, { markPrice: 100, pythPrice: 100, pythAtMs: now, pythBasis: 0, lastUpdatedMs: now, indexHalt: false });
 }
 const logs = [];
-comp.wire({ openAlias: T.openAlias, closeAlias: T.closeAlias, log: (m) => logs.push(m) });
+let _ep = 1;
+comp.wire({
+  openAlias: T.openAlias, closeAlias: T.closeAlias, log: (m) => logs.push(m),
+  // this suite exercises the clock and the draw, not account state
+  resetPlayer: () => (_ep += 1), epochOf: () => _ep,
+});
+/* startRound now refuses an empty roster, because a round with no players
+   cannot be scored and should never reach a stage. Every round here gets a
+   nominal seat. */
+const SEAT = [{ userId: 4242, displayName: 'Test', seat: 0 }];
 
 console.log('\nphase plan, 30 minute round');
 ok('opens in First Five and ends at the bell', () => {
@@ -80,7 +89,7 @@ ok('every boundary is inside the round and ordered', () => {
 
 console.log('\nverifiable draw');
 ok('commitment is published before the seed exists publicly', () => {
-  const r = comp.createRound({ id: 't-commit', candidates: ['BTC', 'SOL', 'ETH'] });
+  const r = comp.createRound({ id: 't-commit', candidates: ['BTC', 'SOL', 'ETH'], players: SEAT });
   assert.ok(r.draw_commit && r.draw_commit.length === 64, 'commit should be a sha256 hex');
   assert.strictEqual(r.draw_seed, null, 'seed must not be stored before the draw');
   assert.strictEqual(r.hot_base, null);
@@ -172,7 +181,7 @@ comp.abortRound('t-lev');
 console.log('\nrestart safety');
 ok('a boundary fires only once', () => {
   const id = 't-once';
-  comp.createRound({ id, candidates: ['BTC', 'SOL'] });
+  comp.createRound({ id, candidates: ['BTC', 'SOL'], players: SEAT });
   comp.startRound(id);
   CT.fireBoundary(id, ROUND_PLAN.round.reveal);
   const first = CT.q.get.get(id).draw_at;
@@ -182,7 +191,7 @@ ok('a boundary fires only once', () => {
 });
 ok('aborting closes segments and stops the round', () => {
   const id = 't-abort';
-  comp.createRound({ id, candidates: ['BTC', 'SOL'] });
+  comp.createRound({ id, candidates: ['BTC', 'SOL'], players: SEAT });
   comp.startRound(id);
   CT.fireBoundary(id, ROUND_PLAN.round.reveal);
   CT.fireBoundary(id, ROUND_PLAN.round.hotStart);
@@ -192,16 +201,28 @@ ok('aborting closes segments and stops the round', () => {
   assert.strictEqual(T.aliasOpen(hot), false);
   assert.strictEqual(CT.q.get.get(id).status, 'aborted');
 });
+ok('a blocked round refuses to open Hot on the backup', () => {
+  const id = 't-nofall';
+  comp.createRound({ id, candidates: ['BTC', 'SOL'], backup: 'ETH', players: SEAT });
+  comp.startRound(id);
+  CT._seeds.delete(id);
+  CT.fireBoundary(id, ROUND_PLAN.round.reveal);      // blocks
+  CT.fireBoundary(id, ROUND_PLAN.round.hotStart);    // must NOT fall through to ETH
+  assert.strictEqual(T.aliasOpen('ETH-HOT'), false, 'an unproven Hot Market must not open');
+  assert.strictEqual(T.aliasOpen('BTC-HOT'), false);
+  comp.abortRound(id);
+});
 ok('drawing without a committed seed fails loudly', () => {
   const id = 't-noseed';
-  comp.createRound({ id, candidates: ['BTC', 'SOL'] });
+  comp.createRound({ id, candidates: ['BTC', 'SOL'], players: SEAT });
   comp.startRound(id);
 
   CT._seeds.delete(id);            // simulate a restart between arming and the draw
-  CT._fired.delete(`${id}@${ROUND_PLAN.round.reveal}`);
   CT.fireBoundary(id, ROUND_PLAN.round.reveal);
-  assert.strictEqual(CT.q.get.get(id).hot_base, null, 'must not draw from an uncommitted seed');
-  assert.ok(logs.some((m) => /seed missing/.test(m)), 'failure should be logged, not silent');
+  const after = CT.q.get.get(id);
+  assert.strictEqual(after.hot_base, null, 'must not draw from an uncommitted seed');
+  assert.match(after.blocked_reason || '', /seed missing/, 'the round must be blocked, not merely logged');
+  assert.strictEqual(CT.q.bGet.get(id, ROUND_PLAN.round.reveal).status, 'failed');
   comp.abortRound(id);
 });
 

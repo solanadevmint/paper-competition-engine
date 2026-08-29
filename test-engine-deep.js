@@ -64,7 +64,12 @@ const CFG = {
 };
 for (const s of ['BTC', 'SOL', 'ETH', 'BNB', 'XRP']) { setMark(s, 100); T.mktCfg.set(s, { ...CFG }); }
 
-comp.wire({ openAlias: T.openAlias, closeAlias: T.closeAlias, scoreUser: T.scoreUser, log: () => {} });
+comp.wire({
+  openAlias: T.openAlias, closeAlias: T.closeAlias, scoreUser: T.scoreUser,
+  // startRound now prepares the roster itself, so it needs the real hooks
+  resetPlayer: T.resetPlayerAccount, epochOf: T.epochOfUser,
+  log: () => {},
+});
 
 const PLAYER = 9101, SPECTATOR = 9102;
 function mkAccount(uid) {

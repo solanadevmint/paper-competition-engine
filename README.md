@@ -23,7 +23,8 @@ New in this snapshot:
 | `competition.js` | Round clock, phase gate, verifiable market draw, scoring. Entirely new. |
 | `paper.js` | Engine. New: alias tickers, the order-path gate, `scoreUser`, the competition HTTP handlers. Everything else predates this work. |
 | `server.js` | HTTP routing. Three new routes. |
-| `test-*.js` | 94 assertions, all passing. |
+| `test-*.js` | 129 assertions, all passing. |
+| `test-integrity.js` | **New.** One case per blocker from the first review round. Adversarial rather than functional: nothing here describes what a well-behaved player does, and all of it changes a published result if it regresses. |
 
 ---
 
@@ -88,20 +89,81 @@ rewarded whoever closed fastest. The test for this is
 
 ---
 
-## Known gaps
+## Fixed since the first review
+
+All ten reported ship blockers are closed, each with a regression test in
+`test-integrity.js`:
+
+1. **Public reset during a round.** Accounts are locked from the moment a
+   player is seated on an armed round until it ends (`accountLocked`); the
+   endpoint returns 409. Also fixed the `bodyRaw` reference bug found in the
+   same function, which meant mode switching there had silently never worked.
+2. **Alias positions skipped by base ticks.** `tickEval` now evaluates the
+   base and both twins from the same incoming mark, so a 1000x position is
+   risk-checked on the tick rather than the 5s sweep.
+3. **Resting segment orders.** `closeAlias` cancels everything resting before
+   settling, and the sweep independently cancels any order on a closed gate.
+4. **In-flight orders crossing a boundary.** The gate, leverage ceiling and
+   round state are re-checked after the await; `awaitBook` is skipped in stage
+   mode entirely; an order arriving after the bell gets 409 `round_settled`.
+5. **Partial checkpoints.** Every seat is scored before anything is written,
+   then written in one transaction. A failed final snapshot sets
+   `blocked_reason` and leaves the round unsettled rather than marking it done.
+   Boundary status is durable (`paper_round_boundaries`), so a failed boundary
+   can be retried and a succeeded one is never replayed.
+6. **Live Hot scoring.** The bonus now includes open Hot exposure marked to
+   market, so the wall shows 2x during the segment instead of jumping at
+   force-close. Tested for continuity across the close, not just correctness.
+7. **Boost semantics.** The legacy per-position 2:00 clock can no longer touch
+   a competition player, on any ticker, and a client-supplied `boostWindow`
+   flag cannot change how a competitor is treated. The public product keeps
+   its clock (also tested).
+8. **Fallback vs the draw proof.** `hot_base` is immutable and is what the
+   commitment proves; `active_hot_base` and `fallback_reason` record what
+   actually traded and why. `verifyDraw` still verifies after a fallback and
+   reports `fellBack`/`traded`.
+9. **Restart before reveal.** A missing seed now blocks the round and
+   `openHot` refuses to open anything undrawn. This was worse than reported:
+   with a backup configured, the old code opened an unproven Hot Market with
+   the 2x multiplier live on it.
+10. **Concurrent rounds.** Enforced at `startRound`. Arming is one
+    transaction and the seed enters memory only after commit.
+
+`startRound` now also resets every seat and binds the scoring epoch to the
+roster row, so preflight and reset are no longer optional buttons and scoring
+cannot change basis mid-round.
+
+## Known gaps, still open
 
 - **Maximum drawdown is not tracked per round.** The format's first tie-break
-  is lowest drawdown; ranking currently falls through to realised PnL, then
-  seat. Flagged in `standings()`.
-- **A flip clears the legacy per-position boost clock.** In `applyFill`, the
-  flip branches insert a fresh position row without stamping `boost_since`, so
-  flipping escapes the old 2:00 auto-settle. This affects the public paper
-  product, not the competition (which gates on phase instead). Unfixed.
-- **No rate limiting on the competition endpoints** beyond the engine's
-  existing per-user write limiter.
+  is lowest drawdown; ranking falls through to realised PnL, then seat.
+- **A flip clears the legacy per-position boost clock** in `applyFill`. Public
+  paper product only; the competition no longer uses that path at all.
+- **Hot close settles player by player**, not from one canonical mark, and a
+  missing mark leaves that player open.
+- **The wall publishes zeroes if scoring throws** rather than showing an error
+  state.
+- **The operator token is accepted in the body as well as a header**, and
+  comparison is not constant-time. No operator audit table yet.
+- **Checkpoints store scalar outputs, not the mark set used**, so a disputed
+  result cannot be independently replayed tick by tick.
+- **The backup market is not inside the commitment.** It is declared at arm
+  time and published with a reason, but not hashed.
+- No rate limiting on the competition endpoints beyond the existing per-user
+  write limiter.
 - The engine runs a $10 bankroll displayed as $100,000 (a 10,000x display
   scale). Order sizes execute at 1/10,000th of displayed size so fills stay at
   top of book. Easy to misread when auditing figures.
+
+## Open product decision, not a bug
+
+**Cross-ticker hedging.** The previous claim that it is "not exploitable" was
+overstated and the reviewer was right. Holding `SOL-HOT` long against `SOL`
+short nets account PnL toward zero while leaving the bonus directional, which
+is a valid low-risk score-only strategy: no guaranteed profit, but it weakens
+the intended "wins and losses both count double" effect and reduces
+liquidation risk. This needs an owner decision (allow it deliberately, or net
+the bonus against base exposure), not more analysis.
 
 ---
 
@@ -112,7 +174,7 @@ file and refuses to run against a path under `/opt/`.
 
 ```sh
 npm install
-for t in test-alias test-competition test-scoring test-comp-api test-engine-deep; do
+for t in test-alias test-competition test-scoring test-comp-api test-engine-deep test-integrity; do
   PAPER_DB=$(mktemp -u --suffix=.db) node $t.js
 done
 ```
@@ -124,6 +186,7 @@ done
 | `test-scoring` | 2x in both directions, bonus/equity separation, frozen checkpoints, prize rules |
 | `test-comp-api` | HTTP surface, auth, pre-flight, live wall payload, public draw verification |
 | `test-engine-deep` | Drives the real order handler end to end: the gate, both segments, and that ordinary trading is undisturbed |
+| `test-integrity` | The ten blockers from review round one, as adversarial regressions |
 
 `test-engine-deep.js` stubs `auth.validateSession` so it can drive
 `placeOrder` without a session or a network call.

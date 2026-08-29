@@ -64,7 +64,12 @@ const now = Date.now();
 for (const s of ['BTC', 'SOL', 'ETH', 'BNB', 'XRP']) {
   T.live.map.set(s, { markPrice: 100, pythPrice: 100, pythAtMs: now, pythBasis: 0, lastUpdatedMs: now, indexHalt: false });
 }
-comp.wire({ openAlias: T.openAlias, closeAlias: T.closeAlias, scoreUser: T.scoreUser, log: () => {} });
+comp.wire({
+  openAlias: T.openAlias, closeAlias: T.closeAlias, scoreUser: T.scoreUser,
+  // startRound now prepares the roster itself, so it needs the real hooks
+  resetPlayer: T.resetPlayerAccount, epochOf: T.epochOfUser,
+  log: () => {},
+});
 const SEATS = [7001, 7002];
 for (const uid of SEATS) {
   T.db.prepare('INSERT OR IGNORE INTO users (id) VALUES (?)').run(uid);
