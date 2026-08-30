@@ -987,7 +987,10 @@ function ingestIndexTick(sym, px, now, comps, spreadBps) {
     if (!cur.indexHalt) live.map.set(sym, { ...cur, indexHalt: true });
     return;                                          // frozen: no price, no eval
   }
-  recordMark(sym, px, now);
+  /* Record with the component count observed at acceptance. A single-source
+     price is still useful to the public product and the chart; it simply must
+     never satisfy a strict competition lookup. */
+  recordMark(sym, px, now, nComps);
   live.map.set(sym, { ...cur, indexHalt: false, markPrice: Number(cur.markPrice) > 0 ? cur.markPrice : px, pythPrice: px, pythAtMs: now, lastUpdatedMs: now, pythBasis: cur.pythBasis != null ? cur.pythBasis : (Number(cur.markPrice) > 0 ? null : 0) });
   live.lastMsgMs = now;
   pythHistPush(sym, now, px);
@@ -1188,6 +1191,9 @@ function init({ apiGet, warehouseGet, log, readRateOk } = {}) {
   comp.wire({
     openAlias, closeAlias, scoreUser,
     prepareSeat, seatState, markSetFor,
+    // a market is competition-ready only if it is indexed AND its composite
+    // currently satisfies the multi-source rule
+    marketReady: (sym) => STAGE_INDEXED.has(baseOf(sym)) && compPriceReady(baseOf(sym)),
     equityOf: (uid) => {
       const a = stmt.acctGet.get(uid);
       return a ? accountRisk(uid, a).equityTotal : Number.NaN;
@@ -1402,12 +1408,23 @@ function uPnl(pos, mark) { return pos.size * (mark - pos.entry_price) * dirOf(po
    slowed by bookkeeping. */
 const MARK_HIST_MS = 180_000;
 const MARK_HIST_MAX = 900;
-const _markHist = new Map();     // sym -> [{t, p}] ascending
-function recordMark(sym, px, t) {
+const _markHist = new Map();     // sym -> [{t, p, n}] ascending, n = component count
+/** Fresh components behind a symbol's index at time t. */
+function componentCount(sym, t = Date.now()) {
+  const c = _idxComps.get(sym);
+  if (!c) return 0;
+  return Object.values(c).filter((x) => t - x.ts < COMP_FRESH_MS).length;
+}
+function recordMark(sym, px, t, comps = null) {
   if (!(Number(px) > 0)) return;
   let a = _markHist.get(sym);
   if (!a) { a = []; _markHist.set(sym, a); }
-  a.push({ t, p: px });
+  /* Provenance travels with the price. A bare {t, p} could not tell a
+     two-source observation from a lone survivor, so a one-component tick was
+     admissible as a "strict" boundary mark. n is the component count at the
+     moment the price was accepted. */
+  const n = Number.isFinite(comps) ? comps : componentCount(sym, t);
+  a.push({ t, p: px, n });
   if (a.length > MARK_HIST_MAX) a.splice(0, a.length - MARK_HIST_MAX);
   const cut = t - MARK_HIST_MS;
   while (a.length && a[0].t < cut) a.shift();
@@ -1423,7 +1440,10 @@ function markAt(sym, ts, { strict = false, maxAgeMs = MARK_MAX_AGE_MS } = {}) {
   if (a && a.length) {
     for (let i = a.length - 1; i >= 0; i--) {
       if (a[i].t <= ts) {
-        if (strict && ts - a[i].t > maxAgeMs) return null;   // too stale to stand behind
+        if (strict) {
+          if (ts - a[i].t > maxAgeMs) return null;                    // too stale to stand behind
+          if ((a[i].n || 0) < COMP_MIN_COMPONENTS) return null;       // single-source: not competition-valid
+        }
         return a[i].p;
       }
     }
@@ -1461,6 +1481,8 @@ function markSetFor(userIds, ts, opts = {}) {
 }
 
 function posMarkOf(pos, marks = null) {
+  // ALWAYS pass the base symbol: without it stageMark skipped its own
+  // readiness check, so a one-source price could still liquidate a position
   if (marks) {
     const m = Number(marks[pos.symbol]);
     if (m > 0) return m;
@@ -1470,7 +1492,7 @@ function posMarkOf(pos, marks = null) {
     throw new Error(`no boundary mark for ${pos.symbol}`);
   }
   const m = mkt(pos.symbol);
-  const px = m && markFor(m, isStage(heatOf(pos.user_id)));
+  const px = m && markFor(m, isStage(heatOf(pos.user_id)), baseOf(pos.symbol));
   return Number.isFinite(px) && px > 0 ? px : (Number(pos.last_mark) || pos.entry_price);
 }
 
@@ -1554,8 +1576,11 @@ function armsLegacyBoost(userId, symbol, lev, boostWindow, acct) {
   return boostWindow;
 }
 
-function applyFill(userId, { symbol, orderSide, size, px, feeBps, kind, orderId = null, leverage = null, marginMode = 'cross', boostWindow = true }) {
-  const now = Date.now();
+function applyFill(userId, { symbol, orderSide, size, px, feeBps, kind, orderId = null, leverage = null, marginMode = 'cross', boostWindow = true, at = null }) {
+  /* `at` lets a boundary-generated fill carry the instant it belongs to
+     rather than the instant it was computed. Ordinary trading passes nothing
+     and keeps wall-clock behaviour. */
+  const now = Number.isFinite(at) ? at : Date.now();
   const acct = ensureAccount(userId);
   if (isStage(acct.heat)) feeBps = 0;   // stage mode: no fees, survivability is pure price
   const pos = stmt.posGet.get(userId, symbol);
@@ -1938,12 +1963,19 @@ async function compAdmin(req, res) {
       return send(res, 200, { ok: true, round: r });
     }
     if (a === 'abort') {
-      const r = comp.abortRound(body.id);
+      // forceAbort is a separate, named, audited act for a blocked round
+      const r = comp.abortRound(body.id, { force: false });
       logOp(req, a, r.id, true, null);
       return send(res, 200, { ok: true, round: r });
     }
     if (a === 'standings') {
       return send(res, 200, { ok: true, board: comp.standings(body.id, body.checkpoint || 'final') });
+    }
+    if (a === 'forceAbort') {
+      if (!body.reason) return send(res, 400, { ok: false, error: 'forceAbort requires a reason' });
+      const r = comp.abortRound(body.id, { force: true });
+      logOp(req, a, body.id, true, String(body.reason).slice(0, 200));
+      return send(res, 200, { ok: true, round: r });
     }
     if (a === 'clearBlock') {
       // deliberate operator recovery; the only way a blocked round resumes
@@ -2085,7 +2117,13 @@ function closeAlias(alias, { flatten = true, roundId = null, settleAt = null } =
   /* Price the segment at the instant it was DUE, not when this ran. A late
      callback used to settle every position at the current price, so the
      segment kept accruing score after its own window had shut. */
-  const mark = Number.isFinite(settleAt) ? markAt(baseOf(alias), settleAt) : markOfFreshFor(alias, true);
+  /* strict: a segment settlement is a scored event. Falling back to the
+     current price let a late callback quietly extend the segment's economics
+     past its own window, which is the failure this scheduled timestamp was
+     introduced to prevent. */
+  const mark = Number.isFinite(settleAt)
+    ? markAt(baseOf(alias), settleAt, { strict: true })
+    : markOfFreshFor(alias, true);
   if (!(Number(mark) > 0)) {
     // fail closed: the caller records the boundary as failed and blocks
     throw new Error(`cannot settle ${alias}: no mark at ${settleAt || 'now'}`);
@@ -2097,6 +2135,11 @@ function closeAlias(alias, { flatten = true, roundId = null, settleAt = null } =
         symbol: alias, orderSide: cSide, size: p.size,
         px: execPxFor(p.user_id, alias, cSide, p.size, mark).px,
         feeBps: cfgOf(alias).takerBps, kind: 'SEGMENT',
+        /* Stamp the BOUNDARY instant. A recovery running after the bell used
+           to stamp Date.now(), which the Hot-bonus query then excluded by its
+           ts <= scheduledAt filter: the same PnL counted once in account PnL
+           and zero times in the bonus, silently paying 1x on a 2x segment. */
+        at: Number.isFinite(settleAt) ? settleAt : undefined,
       });
     }
     const left = stmt.posBySymbol.all(alias).length;
@@ -2115,7 +2158,7 @@ function evalPositionAtMark(p, m, now) {
      account the result was computed from. */
   if (comp.writeBarrier(p.user_id, now)) return;
   const isHeat = isStage(heatOf(p.user_id));
-  const mark = markFor(m, isHeat);
+  const mark = markFor(m, isHeat, baseOf(p.symbol));
   if (!Number.isFinite(mark) || mark <= 0) return;   // halted/blind symbol: touch nothing
   stmt.posMark.run(mark, now, p.user_id, p.symbol);
   settleFunding(p, mark, Number(m.currentFundingRate), now);
@@ -2142,6 +2185,10 @@ function evalPositionAtMark(p, m, now) {
   }
 }
 function evalCrossForUser(uid, now) {
+  /* The per-position pass is guarded, but this user-level pass was not, so a
+     blocked or settled competitor could still be liquidated or have orders
+     cancelled by an incoming tick. */
+  if (comp.writeBarrier(uid, now)) return;
   const acct = stmt.acctGet.get(uid);
   if (!acct) return;
   const risk = accountRisk(uid, acct);
@@ -2176,6 +2223,11 @@ function tickEval(symbol, { force = false } = {}) {
      using it to liquidate, stop or expire anything. Otherwise a tick after
      the bell could change the state the bell is about to score. */
   comp.advanceRoundClock(now);
+  /* Drawdown is a published tie-break, so it is sampled on every accepted
+     competition price rather than every five seconds. A dip and recovery
+     between sweeps was invisible, which made "lowest maximum drawdown"
+     a claim the engine could not actually support. */
+  try { comp.sampleDrawdown(now); } catch { /* never let bookkeeping stall pricing */ }
   /* Evaluate the base AND its event twins from this one incoming mark, so a
      boosted position is risk-checked on the same tick as the market it
      tracks rather than waiting for the sweep. */
@@ -2234,6 +2286,8 @@ function settleFunding(pos, mark, ratePctHourly, now) {
 
 // cross liquidation: progressive, riskiest position first, per-pass size cap
 function liquidateCross(userId) {
+  // defence in depth: a future caller must not be able to bypass the barrier
+  if (comp.writeBarrier(userId)) return;
   const now = Date.now();
   stmt.ordCancelUser.run(now, userId);
   let closed = 0;
@@ -2275,6 +2329,7 @@ function liquidateCross(userId) {
 
 // isolated liquidation: full close of THIS position, loss capped at its margin
 function liquidateIsolated(pos) {
+  if (comp.writeBarrier(pos.user_id)) return;
   const cfg = cfgOf(pos.symbol);
   const lSide = pos.side === 'LONG' ? 'SELL' : 'BUY';
   const lMark = posMarkOf(pos);
@@ -2343,6 +2398,9 @@ async function account(req, res) {
   return send(res, 200, {
     ok: true,
     account: {
+      // the caller's own id: the competition strip needs to find its row in
+      // the public wall feed, which cannot identify who is asking
+      userId: u.id,
       balance: acct.balance, equity: r6(risk.equityTotal), free: r6(Math.max(0, risk.free)),
       uPnl: r6(risk.crossUpnl + (risk.isoValue - risk.positions.filter(isIso).reduce((s, p) => s + p.isolated_margin, 0))),
       maintenance: r6(risk.maint), isolatedValue: r6(risk.isoValue),
@@ -2367,6 +2425,13 @@ async function placeOrder(req, res) {
   const u = await sessionUser(req); if (!u) return send(res, 401, { ok: false, error: 'not_signed_in' });
   if (!writeRateOk(u.id)) return send(res, 429, { ok: false, error: 'rate_limited' });
   let body; try { body = JSON.parse(await readBody(req) || '{}'); } catch { return send(res, 400, { ok: false, error: 'bad_json' }); }
+
+  /* This request is an event, and it must move the round clock BEFORE any
+     phase or gate decision. Checking the alias gate first meant a late timer
+     could reject the very order that should have opened the segment, which
+     made timers authoritative again for exactly the case they were supposed
+     to stop mattering for. */
+  comp.advanceRoundClock(Date.now());
 
   const symbol = String(body.symbol || '').toUpperCase();
   const side = body.side === 'BUY' ? 'BUY' : body.side === 'SELL' ? 'SELL' : null;
@@ -2465,14 +2530,18 @@ async function placeOrder(req, res) {
      start while Hot is open and land after it closed, and an order can start
      before the bell and land after the result was frozen. The gate is cheap;
      a fill that reopens a settled segment is not. */
+  /* Order matters here. The barrier runs FIRST because it advances the clock,
+     and a boundary becoming due at this moment may close the very segment
+     this order is for. Checking the gate before the barrier let a fill land
+     on a ticker the barrier then closed, recreating scored exposure after its
+     window had ended. Nothing below this point may yield again. */
+  if (barred(res, u.id)) return;
   if (aliasKind(symbol) && !aliasOpen(symbol)) {
     return send(res, 400, { ok: false, error: 'market_closed' });
   }
   const levCap2 = comp.levCapFor(symbol, engineCap, u.id);
   if (!(levCap2 > 0)) return send(res, 400, { ok: false, error: 'market_closed' });
   if (leverage > levCap2) leverage = levCap2;
-  // A round that ended during the yield must not accept another write.
-  if (barred(res, u.id)) return;
   const mark2 = markOfFreshFor(symbol, isStage(acctH.heat)) ?? mark;   // refresh after the await
   const acct = ensureAccount(u.id);
   const risk = accountRisk(u.id, acct);
@@ -3023,7 +3092,23 @@ function engineConfig(req, res) {
     // margin requirement surfaced as a misleading "not enough free margin".
     markets[sym] = { maxLev: c.maxLev, stageLev: stageLevCap(sym), indexed: STAGE_INDEXED.has(sym), takerBps: c.takerBps, makerBps: c.makerBps, isolatedOnly: c.isolatedOnly, status: c.status };
   }
-  send(res, 200, { ok: true, levCap: PAPER_MAX_LEV || null, markets });
+  /* Event tickers, while their window is open. The terminal builds its market
+     list from this endpoint, so without them a player could not reach the
+     segment the show is asking them to trade even though the engine accepts
+     the order. They carry their base symbol's economics and are listed
+     separately so the UI can present them as a segment rather than as another
+     market that appeared from nowhere. */
+  const segments = [];
+  for (const alias of openAliases.keys()) {
+    const base = baseOf(alias);
+    const c = cfgOf(alias);
+    markets[alias] = {
+      maxLev: c.maxLev, stageLev: stageLevCap(alias), indexed: STAGE_INDEXED.has(base),
+      takerBps: c.takerBps, makerBps: c.makerBps, isolatedOnly: c.isolatedOnly, status: c.status,
+    };
+    segments.push({ ticker: alias, base, kind: aliasKind(alias) });
+  }
+  send(res, 200, { ok: true, levCap: PAPER_MAX_LEV || null, markets, segments });
 }
 
 // POST /api/paper/guest — mint a throwaway identity so the terminal is usable
@@ -3140,10 +3225,39 @@ function sweep() {
              scored against it. Triggering them from Phoenix venue prints let
              a limit fill at a price the trader's own screen never showed. */
           if (isStage(heatOf(o.user_id))) {
+            /* A stage order lives ENTIRELY in the stage price world and is
+               settled here, not by falling through to the venue path below.
+               Requiring the composite to cross AND then Phoenix prints or the
+               venue mark to cross made the composite necessary but not
+               sufficient: a trader watched their own chart trade through the
+               limit while the order sat resting because a different price
+               world had not moved. */
             const sm = markOfFreshFor(o.symbol, true);
             if (!(Number(sm) > 0)) continue;                       // no index, no fill
-            const crossed = o.side === 'BUY' ? sm <= o.price : sm >= o.price;
-            if (!crossed) continue;
+            if (!(o.side === 'BUY' ? sm <= o.price : sm >= o.price)) continue;
+            const acctS = ensureAccount(o.user_id);
+            const posS = stmt.posGet.get(o.user_id, o.symbol);
+            let sizeS = o.size;
+            if (o.reduce_only) {
+              if (!posS || (o.side === 'BUY') === (posS.side === 'LONG')) { stmt.ordClose.run('CANCELLED', now, o.id); continue; }
+              sizeS = Math.min(sizeS, posS.size);
+              if (!(sizeS > 0)) continue;
+            } else {
+              let addN = sizeS * o.price;
+              if (posS && (o.side === 'BUY') !== (posS.side === 'LONG')) addN = Math.max(0, (sizeS - posS.size) * o.price);
+              const riskS = accountRisk(o.user_id, acctS, { excludeOrderId: o.id });
+              if (addN / o.leverage > riskS.free + 1e-9) { stmt.ordClose.run('CANCELLED', now, o.id); continue; }
+            }
+            /* Fills at the LIMIT price: the composite reached it, and stage
+               has no book to walk and no fees. A maker who named a price gets
+               that price. */
+            applyFill(o.user_id, {
+              symbol: o.symbol, orderSide: o.side, size: sizeS, px: o.price,
+              feeBps: 0, kind: 'LIMIT', orderId: o.id,
+              leverage: o.leverage, marginMode: o.margin_mode,
+            });
+            stmt.ordClose.run('FILLED', now, o.id);
+            continue;                                   // never consult the venue world
           }
           const m = mkt(o.symbol);
           if (!mktFresh(m)) {
@@ -3207,6 +3321,8 @@ function sweep() {
         try {
           const m = mkt(p.symbol);
           if (!mktFresh(m)) {
+            // a delisted-market close is still a mutation of a scored account
+            if (comp.writeBarrier(p.user_id, now)) continue;
             const quietSince = m ? (m.lastUpdatedMs || 0) : 0;
             if ((quietSince && now - quietSince > DELIST_MS) || (!m && now - (p.updated_at || now) > DELIST_MS)) {
               if (Number(p.last_mark) > 0) {

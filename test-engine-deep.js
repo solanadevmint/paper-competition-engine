@@ -24,6 +24,16 @@ const comp = require('./competition.js');
 const P = require('./paper.js');
 const T = P.__test;
 const CT = comp.__test;
+
+/* Fire a boundary the way the clock would: wind the round so the boundary is
+   genuinely due, then fire it. Firing a segment-opening boundary while the
+   phase says otherwise is not something that can happen in production, and
+   the engine now refuses it rather than fabricating a segment. */
+const fireAt = (id, at) => {
+  CT.db.prepare('UPDATE paper_rounds SET started_at = ? WHERE id = ?')
+    .run(Date.now() - at - 200, id);
+  CT.fireBoundary(id, at);
+};
 const { ROUND_PLAN } = comp;
 
 let pass = 0;
@@ -83,8 +93,12 @@ function feedMark(sym, px, t = Date.now()) {
      before it. A fixture that records ONE sample at "now" has no history
      behind it, and a suite fast enough to fire a boundary within the same
      second finds nothing to price from. Seed a short trail. */
-  for (let back = 20_000; back > 0; back -= 2_000) T.recordMark(sym, px, t - back);
-  T.recordMark(sym, px, t);
+  /* Record the component count EXPLICITLY. Deriving it at record time reads
+     whatever components happen to be fresh right then, so a fixture that fed
+     two sources could still write single-source history and make strict
+     pricing refuse it later. This helper genuinely feeds two. */
+  for (let back = 20_000; back > 0; back -= 2_000) T.recordMark(sym, px, t - back, 2);
+  T.recordMark(sym, px, t, 2);
 }
 const CFG = {
   tiers: [], maxLev: 40, lotSize: null, takerBps: 3.5, makerBps: 0.5,
@@ -174,7 +188,7 @@ const balOf = (uid) => T.stmt.acctGet.get(uid).balance;
 
   console.log('\nHot Market segment, end to end');
   warp(ROUND_PLAN.round.reveal + 500);
-  CT.fireBoundary('deep', ROUND_PLAN.round.reveal);
+  fireAt('deep', ROUND_PLAN.round.reveal);
   const HOT = CT.q.get.get('deep').hot_base + '-HOT';
   asUser(PLAYER);
   await ok('the hot ticker is refused before its window opens', async () => {
@@ -182,7 +196,7 @@ const balOf = (uid) => T.stmt.acctGet.get(uid).balance;
     assert.strictEqual(r.body.error, 'market_closed');
   });
   warp(ROUND_PLAN.round.hotStart + 500);
-  CT.fireBoundary('deep', ROUND_PLAN.round.hotStart);
+  fireAt('deep', ROUND_PLAN.round.hotStart);
   await ok('a hot position opens alongside an untouched base position', async () => {
     await order({ symbol: 'BTC', side: 'BUY', type: 'MARKET', size: 0.01, leverage: 10 });
     const r = await order({ symbol: HOT, side: 'BUY', type: 'MARKET', size: 0.01, leverage: 10 });
@@ -198,7 +212,7 @@ const balOf = (uid) => T.stmt.acctGet.get(uid).balance;
   await ok('segment close flattens the hot leg only, and pays the bonus', async () => {
     setMarkRaw(CT.q.get.get('deep').hot_base, 110); feedMark(CT.q.get.get('deep').hot_base, 110);   // hot leg +0.10
     warp(ROUND_PLAN.round.hotEnd + 500);
-    CT.fireBoundary('deep', ROUND_PLAN.round.hotEnd);
+    fireAt('deep', ROUND_PLAN.round.hotEnd);
     assert.strictEqual(posOf(PLAYER, HOT), undefined, 'hot leg must be flat');
     assert.ok(posOf(PLAYER, 'BTC'), 'base leg must survive');
     const s = T.scoreUser(PLAYER, HOT);
@@ -208,7 +222,7 @@ const balOf = (uid) => T.stmt.acctGet.get(uid).balance;
 
   console.log('\nBoost window, end to end');
   warp(ROUND_PLAN.round.boostStart + 500);
-  CT.fireBoundary('deep', ROUND_PLAN.round.boostStart);
+  fireAt('deep', ROUND_PLAN.round.boostStart);
   await ok('a boost twin accepts 1000x for a player', async () => {
     const r = await order({ symbol: 'BTC-BOOST', side: 'BUY', type: 'MARKET', size: 0.001, leverage: 1000 });
     assert.strictEqual(r.code, 200, JSON.stringify(r.body));
@@ -237,7 +251,7 @@ const balOf = (uid) => T.stmt.acctGet.get(uid).balance;
     const openBefore = T.stmt.posByUser.all(PLAYER).length;
     assert.ok(openBefore > 0, 'the player should still be holding something');
     warp(ROUND_PLAN.round.total + 500);
-    CT.fireBoundary('deep', ROUND_PLAN.round.total);
+    fireAt('deep', ROUND_PLAN.round.total);
     assert.strictEqual(T.stmt.posByUser.all(PLAYER).length, openBefore,
       'nothing may be force-closed at the bell');
     const board = comp.standings('deep', 'final');

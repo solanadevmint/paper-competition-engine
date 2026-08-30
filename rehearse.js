@@ -35,13 +35,14 @@ const ok = (msg) => console.log(`   ok    ${msg}`);
 const bad = (msg) => { console.log(`   FAIL  ${msg}`); failures++; };
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-function req(method, path, body) {
+function req(method, path, body, extraHeaders) {
   return new Promise((resolve, reject) => {
     const data = body ? JSON.stringify(body) : null;
     const headers = { 'content-type': 'application/json' };
     if (TOKEN) headers['x-comp-token'] = TOKEN;
     if (GATE) headers['x-paper-gate'] = GATE;
     if (data) headers['content-length'] = Buffer.byteLength(data);
+    Object.assign(headers, extraHeaders || {});
     const r = http.request(BASE + path, { method, headers, timeout: 15000 }, (res) => {
       let b = '';
       res.on('data', (c) => { b += c; });
@@ -57,6 +58,36 @@ function req(method, path, body) {
   });
 }
 const admin = (action, extra = {}) => req('POST', '/api/paper/comp/admin', { action, ...extra });
+
+/* Trading as a seated player, over HTTP against the LIVE engine.
+ *
+ * An earlier version required paper.js inside this process and called
+ * placeOrder directly. That silently created a SECOND engine instance: the
+ * database was shared but the in-memory alias registry, round cache and price
+ * state were not, so segment gates looked closed and positions were written
+ * by an engine nobody was driving. A drill that does not go through the same
+ * door as a real trader is not testing the thing that will be on stage.
+ *
+ * Sessions are minted with the internal secret the engine already trusts. */
+/* Real session cookies, minted outside the drill and passed in base64 (the
+   raw JSON is full of double quotes and does not survive a shell command
+   line). No test-only auth bypass is added to a competition engine just to
+   make a drill convenient. */
+const SEAT_TOKENS = JSON.parse(
+  process.env.SEAT_TOKENS_B64
+    ? Buffer.from(process.env.SEAT_TOKENS_B64, 'base64').toString('utf8')
+    : '{}'
+);
+function trade(userId, body) {
+  const tok = SEAT_TOKENS[String(userId)];
+  if (!tok) return Promise.resolve({ code: 0, body: { error: 'no session for seat ' + userId } });
+  return req('POST', '/api/paper/order', body, { cookie: 'phoenix_session=' + tok });
+}
+const positionsOf = (userId) => {
+  const a = require('/opt/phoenix-paper/auth-shim.js');
+  return a.db.prepare('SELECT symbol, side, size, entry_price, leverage, margin_mode FROM paper_positions WHERE user_id = ? ORDER BY symbol').all(userId);
+};
+
 const state = () => req('GET', '/api/paper/comp/state');
 
 function restartEngine(why) {
@@ -141,6 +172,16 @@ async function cleanup() {
     r = await admin('start', { id: ROUND });
     r.body.ok ? ok('running') : bad('start failed: ' + JSON.stringify(r.body));
 
+    step('open real exposure before anything is injected');
+    {
+      const r1 = await trade(IDS[0], { symbol: 'BTC', side: 'BUY', type: 'MARKET', notionalUsd: 1, leverage: 10 });
+      r1.code === 200 ? ok('base position open') : bad('base order refused: ' + JSON.stringify(r1.body));
+      const before = positionsOf(IDS[0]);
+      before.length ? ok(`carrying ${before.length} position(s) into the faults`)
+                    : bad('no exposure to carry');
+      global.__before = before;
+    }
+
     step('fault 1: restart just after the draw commits');
     let s = await waitPhase('reveal');
     if (!s) { bad('never reached the reveal'); } else {
@@ -150,6 +191,13 @@ async function cleanup() {
         s = (await state()).body;
         if (s.blocked) bad('a persisted draw should NOT block: ' + s.blockedReason);
         else ok('survived the restart without blocking');
+        /* Position identity must survive a restart exactly: same symbol, side,
+           size, entry and margin mode. A phantom fill or a silent liquidation
+           here would be invisible to a drill that carried no exposure. */
+        const after = positionsOf(IDS[0]);
+        const same = JSON.stringify(after) === JSON.stringify(global.__before);
+        same ? ok('exposure survived the restart unchanged')
+             : bad(`exposure changed across restart:\n     before ${JSON.stringify(global.__before)}\n     after  ${JSON.stringify(after)}`);
       }
     }
 
@@ -177,6 +225,21 @@ async function cleanup() {
       }
     }
 
+    step('fault 2b: trade the Hot segment, then restart again');
+    {
+      s = (await state().catch(() => ({ body: {} }))).body;
+      if (s.live && s.hot && s.hot.open) {
+        const r2 = await trade(IDS[0], { symbol: s.hot.ticker, side: 'BUY', type: 'MARKET', notionalUsd: 1, leverage: 10 });
+        r2.code === 200 ? ok(`hot exposure open on ${s.hot.ticker}`)
+                        : bad('hot order refused: ' + JSON.stringify(r2.body));
+        const hotPos = positionsOf(IDS[0]).filter((p) => p.symbol.endsWith('-HOT'));
+        hotPos.length ? ok('hot leg is a separate position, as designed')
+                      : bad('no hot position created');
+      } else {
+        bad('Hot window not open when expected');
+      }
+    }
+
     step('fault 3: operator mistake mid-round');
     r = await admin('resetPlayers', { id: ROUND });
     r.code === 409 ? ok('resetPlayers refused on a live round')
@@ -188,6 +251,18 @@ async function cleanup() {
       if (!s.live) break;
       await sleep(1000);
     }
+    /* The Hot leg must have been force-closed by its own boundary and scored
+       at 2x, while the base leg is still open and marked at the bell. */
+    {
+      const left = positionsOf(IDS[0]);
+      left.some((p) => p.symbol.endsWith('-HOT'))
+        ? bad('a Hot position survived its segment: ' + JSON.stringify(left))
+        : ok('hot leg settled by its segment, base leg left open');
+      left.some((p) => !p.symbol.includes('-'))
+        ? ok('base position marked at the bell, not force-closed')
+        : bad('the base position vanished: ' + JSON.stringify(left));
+    }
+
     r = await admin('standings', { id: ROUND, checkpoint: 'final' });
     const board = (r.body && r.body.board) || [];
     board.length === IDS.length ? ok(`final settled for ${board.length} seats`)

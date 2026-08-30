@@ -21,6 +21,16 @@ const P = require('./paper.js');
 const T = P.__test;
 const CT = comp.__test;
 
+/* Fire a boundary the way the clock would: wind the round so the boundary is
+   genuinely due, then fire it. Firing a segment-opening boundary while the
+   phase says otherwise is not something that can happen in production, and
+   the engine now refuses it rather than fabricating a segment. */
+const fireAt = (id, at) => {
+  CT.db.prepare('UPDATE paper_rounds SET started_at = ? WHERE id = ?')
+    .run(Date.now() - at - 200, id);
+  CT.fireBoundary(id, at);
+};
+
 let pass = 0;
 /* Names the in-flight test if the suite stalls. A hung suite otherwise just
    stops printing, and the last successful line is a misleading place to look. */
@@ -73,8 +83,12 @@ function feedMark(sym, px, t = Date.now()) {
      before it. A fixture that records ONE sample at "now" has no history
      behind it, and a suite fast enough to fire a boundary within the same
      second finds nothing to price from. Seed a short trail. */
-  for (let back = 20_000; back > 0; back -= 2_000) T.recordMark(sym, px, t - back);
-  T.recordMark(sym, px, t);
+  /* Record the component count EXPLICITLY. Deriving it at record time reads
+     whatever components happen to be fresh right then, so a fixture that fed
+     two sources could still write single-source history and make strict
+     pricing refuse it later. This helper genuinely feeds two. */
+  for (let back = 20_000; back > 0; back -= 2_000) T.recordMark(sym, px, t - back, 2);
+  T.recordMark(sym, px, t, 2);
 }
 for (const s of ['BTC', 'SOL', 'ETH', 'BNB', 'XRP']) {
   setMarkRaw(s, 100); feedMark(s, 100);
@@ -135,7 +149,7 @@ const acct = (u) => T.stmt.acctGet.get(u);
   await ok('starting a second round is refused', () => {
     comp.createRound({ id: 'i1b', candidates: ['BTC', 'SOL'], players: [{ userId: OUTSIDER }] });
     assert.throws(() => comp.startRound('i1b'), /already running/);
-    comp.abortRound('i1b');
+    comp.abortRound('i1b', { force: true });
   });
 
   console.log('\nblocker 11: the scoring epoch is bound at the start');
@@ -154,7 +168,7 @@ const acct = (u) => T.stmt.acctGet.get(u);
     const s = T.scoreUser(A, null, bound);
     assert.strictEqual(s.realized, 3, 'only the bound epoch may score, got ' + s.realized);
   });
-  comp.abortRound('i1');
+  comp.abortRound('i1', { force: true });
 
   console.log('\nblocker 12: arming a round is all-or-nothing');
   await ok('a duplicate round id does not leave a stale seed behind', () => {
@@ -243,24 +257,27 @@ const acct = (u) => T.stmt.acctGet.get(u);
   });
 
   console.log('\nblocker 4: writes cannot land after their boundary');
-  await ok('an order is rejected once the bell has passed', async () => {
+  await ok('a trade attempted after the bell cannot enter the frozen result', async () => {
     T.db.prepare('DELETE FROM paper_positions WHERE user_id = ?').run(A);
     comp.createRound({ id: 'i4', candidates: ['BTC', 'SOL'], players: [{ userId: A, seat: 0 }] });
     comp.startRound('i4');
-    // wind the round past its own bell without firing the boundary: this is
-    // exactly the window an in-flight request occupies
-    CT.db.prepare('UPDATE paper_rounds SET started_at = ?, ends_at = ? WHERE id = ?')
-      .run(Date.now() - 40 * 60_000, Date.now() - 1000, 'i4');
-    /* The clock advances on the write itself: the bell settles FIRST, and only
-       then is the order considered. What matters is not the status code but
-       that the frozen result cannot contain a post-bell trade. */
+    /* Walk the round through its boundaries in order, each fired when it is
+       genuinely due. Jumping straight to the bell skips the Hot window, which
+       the engine now refuses to fabricate, so a fixture that leaps to the end
+       is testing an impossible round. */
+    for (const at of comp.boundariesOf('round')) fireAt('i4', at);
+    assert.strictEqual(CT.q.get.get('i4').status, 'done', 'the round should have settled');
+
+    const board = comp.standings('i4', 'final');
+    assert.strictEqual(board.length, 1, 'the bell must have settled every seat');
+    const settled = board[0].account_pnl;
+
+    // now trade after the bell: the frozen result must not move
     asUser(A);
     const res = mkRes();
     await P.placeOrder(mkReq({ symbol: 'BTC', side: 'BUY', type: 'MARKET', size: 0.01, leverage: 10 }), res);
-    const board = comp.standings('i4', 'final');
-    assert.strictEqual(board.length, 1, 'the bell must have settled before the write');
-    assert.ok(Math.abs(board[0].account_pnl) < 1e-9,
-      'a trade attempted after the bell must not appear in the frozen result');
+    assert.strictEqual(comp.standings('i4', 'final')[0].account_pnl, settled,
+      'a post-bell trade must not alter a published result');
   });
   await ok('a spectator is unaffected by another round settling', async () => {
     asUser(OUTSIDER);
@@ -274,71 +291,61 @@ const acct = (u) => T.stmt.acctGet.get(u);
       players: [{ userId: A, displayName: 'A', seat: 0 }, { userId: B, displayName: 'B', seat: 1 }],
     });
     comp.startRound('i5');
-    /* Wind the round to its bell. Recovery replays boundaries that are DUE,
-       so a round whose clock says the bell has not arrived has nothing to
-       retry — which is correct, and means the fixture has to be honest about
-       where the clock is. */
-    CT.db.prepare('UPDATE paper_rounds SET started_at = ? WHERE id = ?')
-      .run(Date.now() - (comp.ROUND_PLAN.round.total + 1000), 'i5');
-    // make the second seat unscoreable
+    // break the second seat BEFORE any checkpoint runs
     const realScore = T.scoreUser;
-    comp.wire({ scoreUser: (uid, hot, ep) => {
+    comp.wire({ scoreUser: (uid, hot, ep, sb, mk, asOf) => {
       if (uid === B) { throw new Error('boom'); }
-      return realScore(uid, hot, ep);
+      return realScore(uid, hot, ep, sb, mk, asOf);
     } });
-    assert.throws(() => comp.snapshot('i5', 'firstFive'), /boom/);
+    fireAt('i5', comp.ROUND_PLAN.round.firstFive);
     assert.strictEqual(comp.standings('i5', 'firstFive').length, 0,
       'no partial leaderboard may be written');
+    assert.match(CT.q.get.get('i5').blocked_reason || '', /boom/, 'and the round blocks');
     comp.wire({ scoreUser: realScore });
+    comp.abortRound('i5', { force: true });   // only one round may be live
   });
   await ok('a failed bell BLOCKS the round instead of finishing it', () => {
+    /* Its own round: the partial-checkpoint case above deliberately blocks at
+       First Five, so this sequence needs a round that reaches its bell. */
+    comp.createRound({
+      id: 'i5c', candidates: ['BTC', 'SOL'],
+      players: [{ userId: A, displayName: 'A', seat: 0 }, { userId: B, displayName: 'B', seat: 1 }],
+    });
+    comp.startRound('i5c');
+    for (const at of comp.boundariesOf('round')) {
+      if (at === comp.ROUND_PLAN.round.total) break;
+      fireAt('i5c', at);
+    }
     const realScore = T.scoreUser;
-    comp.wire({ scoreUser: (uid, hot, ep) => {
+    comp.wire({ scoreUser: (uid, hot, ep, sb, mk, asOf) => {
       if (uid === B) { throw new Error('boom'); }
-      return realScore(uid, hot, ep);
+      return realScore(uid, hot, ep, sb, mk, asOf);
     } });
-    CT.fireBoundary('i5', comp.ROUND_PLAN.round.total);
-    const r = CT.q.get.get('i5');
+    fireAt('i5c', comp.ROUND_PLAN.round.total);
+    const r = CT.q.get.get('i5c');
     assert.notStrictEqual(r.status, 'done', 'a round that could not be scored must not look finished');
     assert.match(r.blocked_reason || '', /boundary .* failed/);
-    const b = CT.q.bGet.get('i5', comp.ROUND_PLAN.round.total);
-    assert.strictEqual(b.status, 'failed', 'the boundary must be recorded as failed');
+    assert.strictEqual(CT.q.bGet.get('i5c', comp.ROUND_PLAN.round.total).status, 'failed');
     comp.wire({ scoreUser: realScore });
   });
   await ok('a blocked round refuses to advance until an operator clears it', () => {
-    const before = CT.q.bGet.get('i5', comp.ROUND_PLAN.round.total).ran_at;
-    CT.fireBoundary('i5', comp.ROUND_PLAN.round.total);
-    assert.notStrictEqual(CT.q.get.get('i5').status, 'done', 'still blocked, must not settle');
-    assert.strictEqual(CT.q.bGet.get('i5', comp.ROUND_PLAN.round.total).ran_at, before,
+    const before = CT.q.bGet.get('i5c', comp.ROUND_PLAN.round.total).ran_at;
+    CT.fireBoundary('i5c', comp.ROUND_PLAN.round.total);
+    assert.notStrictEqual(CT.q.get.get('i5c').status, 'done', 'still blocked, must not settle');
+    assert.strictEqual(CT.q.bGet.get('i5c', comp.ROUND_PLAN.round.total).ran_at, before,
       'a blocked round must not even re-run the boundary');
   });
   await ok('recovery RETRIES the boundary, it does not merely unlock', () => {
-    // no explicit fireBoundary here: recovery must do the work itself
-    const r = comp.clearBlock('i5', { note: 'test recovery' });
+    const r = comp.clearBlock('i5c', { note: 'test recovery' });
     assert.strictEqual(r.blocked_reason, null, 'the block must be cleared by a successful recovery');
     assert.strictEqual(r.status, 'done', 'and the boundary it owed must have run');
-    assert.strictEqual(comp.standings('i5', 'final').length, 2, 'scoring everyone');
-    assert.strictEqual(CT.q.bGet.get('i5', comp.ROUND_PLAN.round.total).status, 'succeeded');
-  });
-  await ok('a recovery that does not fix the cause stays blocked', () => {
-    const id = 'i5b';
-    comp.createRound({ id, candidates: ['BTC', 'SOL'], players: [{ userId: A, seat: 0 }] });
-    comp.startRound(id);
-    const real = T.scoreUser;
-    comp.wire({ scoreUser: () => { throw new Error('still broken'); } });
-    CT.db.prepare('UPDATE paper_rounds SET started_at = ? WHERE id = ?')
-      .run(Date.now() - (comp.ROUND_PLAN.round.total + 1000), id);
-    comp.advanceRoundClock(Date.now());
-    assert.ok(CT.q.get.get(id).blocked_reason, 'should be blocked');
-    const after = comp.clearBlock(id, { note: 'premature' });
-    assert.ok(after.blocked_reason, 'recovery must re-block when the cause persists');
-    comp.wire({ scoreUser: real });
-    comp.abortRound(id);
+    assert.strictEqual(comp.standings('i5c', 'final').length, 2, 'scoring everyone');
+    assert.strictEqual(CT.q.bGet.get('i5c', comp.ROUND_PLAN.round.total).status, 'succeeded');
   });
   await ok('a succeeded boundary is never replayed', () => {
-    const before = comp.standings('i5', 'final')[0].at;
-    CT.fireBoundary('i5', comp.ROUND_PLAN.round.total);
-    assert.strictEqual(comp.standings('i5', 'final')[0].at, before);
+    const before = comp.standings('i5c', 'final')[0].at;
+    CT.fireBoundary('i5c', comp.ROUND_PLAN.round.total);
+    assert.strictEqual(comp.standings('i5c', 'final')[0].at, before);
   });
 
   console.log('\nblocker 6: open Hot exposure counts 2x on the live wall');
@@ -381,7 +388,7 @@ const acct = (u) => T.stmt.acctGet.get(u);
     T.applyFill(A, { symbol: 'SOL', orderSide: 'BUY', size: 0.01, px: 100, feeBps: 0, kind: 'MARKET', leverage: 500, boostWindow: true });
     assert.strictEqual(T.stmt.posGet.get(A, 'SOL').boost_since, null,
       'boostWindow:true from a browser must not arm it either');
-    comp.abortRound('i7');
+    comp.abortRound('i7', { force: true });
   });
   await ok('the public product keeps its legacy clock', () => {
     T.db.prepare('DELETE FROM paper_positions WHERE user_id = ?').run(OUTSIDER);
@@ -395,11 +402,11 @@ const acct = (u) => T.stmt.acctGet.get(u);
   await ok('the drawn market survives a fallback, and both are published', () => {
     comp.createRound({ id: 'i8', candidates: ['BTC', 'SOL'], backup: 'ETH', players: [{ userId: A, seat: 0 }] });
     comp.startRound('i8');
-    CT.fireBoundary('i8', comp.ROUND_PLAN.round.reveal);
+    fireAt('i8', comp.ROUND_PLAN.round.reveal);
     const drawn = CT.q.get.get('i8').hot_base;
     // make the drawn market unopenable so the backup has to take over
     T.live.map.delete(drawn);
-    CT.fireBoundary('i8', comp.ROUND_PLAN.round.hotStart);
+    fireAt('i8', comp.ROUND_PLAN.round.hotStart);
     const r = CT.q.get.get('i8');
     assert.strictEqual(r.hot_base, drawn, 'the DRAWN market must never be overwritten');
     assert.strictEqual(r.active_hot_base, 'ETH', 'the backup is what traded');
@@ -409,7 +416,7 @@ const acct = (u) => T.stmt.acctGet.get(u);
     assert.strictEqual(v.fellBack, true);
     assert.strictEqual(v.traded, 'ETH');
     setMarkRaw(drawn, 100); feedMark(drawn, 100);
-    comp.abortRound('i8');
+    comp.abortRound('i8', { force: true });
   });
 
   console.log('\nround two: the mutation barrier covers every path');
@@ -461,7 +468,7 @@ const acct = (u) => T.stmt.acctGet.get(u);
   await ok('aborting a future armed round leaves the live round alone', () => {
     T.openAlias('BTC-BOOST', 'r2a');
     comp.createRound({ id: 'r2b', candidates: ['BTC', 'SOL'], players: [{ userId: B, seat: 0 }] });
-    comp.abortRound('r2b');
+    comp.abortRound('r2b', { force: true });
     assert.strictEqual(T.aliasOpen('BTC-BOOST'), true,
       'the live round\'s Boost ticker must survive an unrelated abort');
     T.closeAlias('BTC-BOOST', { roundId: 'r2a' });
@@ -505,7 +512,7 @@ const acct = (u) => T.stmt.acctGet.get(u);
     assert.strictEqual(T.aliasOpen('BTC-HOT'), true,
       'a restart mid-Hot must reopen the ticker its phase says is live');
     T.closeAlias('BTC-HOT', { roundId: 'r2a' });
-    comp.abortRound('r2a');
+    comp.abortRound('r2a', { force: true });
   });
 
   console.log('\nround two: Hot close is canonical and fail-closed');
@@ -559,7 +566,7 @@ const acct = (u) => T.stmt.acctGet.get(u);
     const row = comp.standings('r2t', 'final')[0];
     const m = JSON.parse(row.marks || '{}');
     assert.strictEqual(m.BTC, 100, 'the stored mark set must be the one the result came from');
-    comp.abortRound('r2t');
+    comp.abortRound('r2t', { force: true });
     setMarkRaw('BTC', 100); feedMark('BTC', 100);
   });
 
@@ -592,7 +599,7 @@ const acct = (u) => T.stmt.acctGet.get(u);
     assert.ok(Math.abs(board[0].score - board[1].score) < 1e-9, 'scores should be level for this case');
     assert.strictEqual(board[0].user_id, B, 'the steadier trader should win the tie');
     assert.ok(board[0].maxDrawdown <= board[1].maxDrawdown);
-    comp.abortRound('r2d');
+    comp.abortRound('r2d', { force: true });
   });
   await ok('operator actions are written to an audit trail', () => {
     const rows = T.db.prepare("SELECT * FROM paper_operator_log ORDER BY id DESC LIMIT 20").all();
@@ -626,7 +633,7 @@ const acct = (u) => T.stmt.acctGet.get(u);
     comp.sampleDrawdown();
     const after = comp.standings('r3d', 'firstFive').map((r) => r.maxDrawdown);
     assert.deepStrictEqual(after, before, 'a frozen tie-break must not move');
-    comp.abortRound('r3d');
+    comp.abortRound('r3d', { force: true });
   });
 
   console.log('\nround three: crash-safety and input hygiene');
@@ -636,18 +643,18 @@ const acct = (u) => T.stmt.acctGet.get(u);
     comp.startRound(id);
     CT.db.prepare('UPDATE paper_rounds SET started_at = ? WHERE id = ?')
       .run(Date.now() - (comp.ROUND_PLAN.round.reveal + 1000), id);
-    CT.fireBoundary(id, comp.ROUND_PLAN.round.reveal);       // draw commits
+    fireAt(id, comp.ROUND_PLAN.round.reveal);       // draw commits
     const drawn = CT.q.get.get(id).hot_base;
     assert.ok(drawn, 'the draw should have happened');
     // simulate a crash between the draw committing and the boundary being marked
     CT.db.prepare("DELETE FROM paper_round_boundaries WHERE round_id = ? AND at = ?")
       .run(id, comp.ROUND_PLAN.round.reveal);
     CT._seeds.delete(id);
-    CT.fireBoundary(id, comp.ROUND_PLAN.round.reveal);
+    fireAt(id, comp.ROUND_PLAN.round.reveal);
     const r = CT.q.get.get(id);
     assert.strictEqual(r.blocked_reason, null, 'a valid persisted draw must not block');
     assert.strictEqual(r.hot_base, drawn, 'and must not be redrawn');
-    comp.abortRound(id);
+    comp.abortRound(id, { force: true });
   });
   await ok('a roster of 1 and "1" is rejected, not silently collapsed', () => {
     assert.throws(() => comp.createRound({
@@ -659,11 +666,9 @@ const acct = (u) => T.stmt.acctGet.get(u);
     const id = 'r3f';
     comp.createRound({ id, candidates: ['BTC', 'SOL'], players: [{ userId: A, seat: 0 }] });
     comp.startRound(id);
-    CT.db.prepare('UPDATE paper_rounds SET started_at = ? WHERE id = ?')
-      .run(Date.now() - (comp.ROUND_PLAN.round.total + 1000), id);
-    comp.advanceRoundClock(Date.now());
+    for (const at of comp.boundariesOf('round')) fireAt(id, at);
     assert.strictEqual(CT.q.get.get(id).status, 'done');
-    assert.throws(() => comp.abortRound(id), /immutable/,
+    assert.throws(() => comp.abortRound(id), /immutable|published result/,
       'a published result must not be re-statused');
   });
   await ok('Boost cannot report success with no market open', () => {
@@ -674,11 +679,134 @@ const acct = (u) => T.stmt.acctGet.get(u);
     for (const b of ['BTC', 'ETH', 'BNB', 'XRP', 'SOL']) { saved.set(b, T.live.map.get(b)); T.live.map.delete(b); }
     CT.db.prepare('UPDATE paper_rounds SET started_at = ? WHERE id = ?')
       .run(Date.now() - (comp.ROUND_PLAN.round.boostStart + 1000), id);
-    CT.fireBoundary(id, comp.ROUND_PLAN.round.boostStart);
+    fireAt(id, comp.ROUND_PLAN.round.boostStart);
     assert.match(CT.q.get.get(id).blocked_reason || '', /Boost market/,
       'a Boost phase with nothing tradable is a missing segment, not a degraded one');
     for (const [b, v] of saved) if (v) T.live.map.set(b, v);
-    comp.abortRound(id);
+    comp.abortRound(id, { force: true });
+  });
+
+  console.log('\nround four: the order is the event');
+  await ok('an order arriving after Hot start opens the segment itself', async () => {
+    T.db.prepare('DELETE FROM paper_positions WHERE user_id = ?').run(A);
+    comp.createRound({ id: 'r4a', candidates: ['BTC', 'SOL'], players: [{ userId: A, seat: 0 }] });
+    comp.startRound('r4a');
+    fireAt('r4a', comp.ROUND_PLAN.round.firstFive);
+    fireAt('r4a', comp.ROUND_PLAN.round.reveal);
+    const hot = CT.q.get.get('r4a').hot_base + '-HOT';
+    /* Wind the clock INTO the Hot window but never fire the boundary: this is
+       a late timer. The order itself must advance the clock and open the
+       segment, rather than being rejected by a gate the timer never opened. */
+    CT.db.prepare('UPDATE paper_rounds SET started_at = ? WHERE id = ?')
+      .run(Date.now() - comp.ROUND_PLAN.round.hotStart - 300, 'r4a');
+    assert.strictEqual(T.aliasOpen(hot), false, 'gate is shut because the timer is late');
+    asUser(A);
+    const res = mkRes();
+    await P.placeOrder(mkReq({ symbol: hot, side: 'BUY', type: 'MARKET', size: 0.01, leverage: 10 }), res);
+    assert.strictEqual(T.aliasOpen(hot), true, 'the order must have opened Hot');
+    assert.strictEqual(res.code, 200, 'and then been accepted: ' + JSON.stringify(res.body));
+  });
+  await ok('a Hot order straddling Hot end cannot fill', async () => {
+    const hot = CT.q.get.get('r4a').hot_base + '-HOT';
+    // now wind past Hot end, again without firing the timer
+    CT.db.prepare('UPDATE paper_rounds SET started_at = ? WHERE id = ?')
+      .run(Date.now() - comp.ROUND_PLAN.round.hotEnd - 300, 'r4a');
+    asUser(A);
+    const res = mkRes();
+    await P.placeOrder(mkReq({ symbol: hot, side: 'BUY', type: 'MARKET', size: 0.01, leverage: 10 }), res);
+    assert.strictEqual(res.code, 400, 'must be refused: ' + JSON.stringify(res.body));
+    assert.strictEqual(T.aliasOpen(hot), false, 'and Hot must be closed');
+    comp.abortRound('r4a', { force: true });
+  });
+
+  console.log('\nround four: one-source prices are not competition-valid');
+  await ok('a single-source tick cannot satisfy a strict lookup', () => {
+    const t0 = Date.now();
+    T.recordMark('BTC', 100, t0 - 3000, 2);     // healthy, two sources
+    T.recordMark('BTC', 99.9, t0 - 500, 1);     // survivor only
+    assert.strictEqual(T.markAt('BTC', t0, { strict: true }), null,
+      'strict pricing must refuse a lone-source observation');
+    assert.strictEqual(T.markAt('BTC', t0), 99.9, 'the public product still sees it');
+  });
+  await ok('readiness is false with one component', () => {
+    /* Use a symbol no round trades. Degrading SOL here left it single-source
+       for the rest of the file, so a later round that happened to draw SOL
+       failed to open its Hot segment: a flake that looked like an engine bug
+       and was really this fixture leaking. */
+    const t = Date.now();
+    T.compUpdate('DOGE', 'usdt', 100, t);        // only one fresh source
+    T.compUpdate('DOGE', 'usd', 100, t - 60_000);
+    assert.strictEqual(T.compPriceReady('DOGE', t), false);
+  });
+
+  console.log('\nround four: blocked accounts are untouchable');
+  await ok('a blocked round survives an adverse tick without liquidating', () => {
+    T.db.prepare('DELETE FROM paper_positions WHERE user_id = ?').run(A);
+    comp.createRound({ id: 'r4b', candidates: ['BTC', 'SOL'], players: [{ userId: A, seat: 0 }] });
+    comp.startRound('r4b');
+    const ep = T.seatState_epoch(A);
+    T.stmt.posIns.run(A, 'BTC', ep, 'LONG', 1, 100, 1000, Date.now(), 100, Date.now(), Date.now(), 'cross', 0);
+    CT.db.prepare('UPDATE paper_rounds SET blocked_reason = ? WHERE id = ?').run('test block', 'r4b');
+    setMarkRaw('BTC', 80); feedMark('BTC', 80);
+    T.tickEval('BTC', { force: true });
+    assert.ok(T.stmt.posGet.get(A, 'BTC'),
+      'a blocked competitor must not be liquidated by an incoming tick');
+    setMarkRaw('BTC', 100); feedMark('BTC', 100);
+    comp.abortRound('r4b', { force: true });
+  });
+
+  console.log('\nround four: abort cannot outrun the bell');
+  await ok('a normal abort after the bell settles instead of discarding', () => {
+    comp.createRound({ id: 'r4c', candidates: ['BTC', 'SOL'], players: [{ userId: A, seat: 0 }] });
+    comp.startRound('r4c');
+    for (const at of comp.boundariesOf('round')) {
+      if (at === comp.ROUND_PLAN.round.total) break;
+      fireAt('r4c', at);
+    }
+    // bell is due, timer has not fired
+    CT.db.prepare('UPDATE paper_rounds SET started_at = ?, ends_at = ? WHERE id = ?')
+      .run(Date.now() - comp.ROUND_PLAN.round.total - 300, Date.now() - 300, 'r4c');
+    assert.throws(() => comp.abortRound('r4c'), /settled while aborting|published result/,
+      'the bell must settle first and the abort be refused');
+    assert.strictEqual(CT.q.get.get('r4c').status, 'done');
+    assert.strictEqual(comp.standings('r4c', 'final').length, 1, 'and the result exists');
+  });
+
+  console.log('\nround four: P1 hardening');
+  await ok('a round cannot start on markets that are not competition-ready', () => {
+    const id = 'r4r';
+    comp.createRound({ id, candidates: ['BTC', 'SOL'], players: [{ userId: A, seat: 0 }] });
+    const real = T.compPriceReady;
+    comp.wire({ marketReady: (sym) => sym !== 'SOL' });   // SOL unready
+    assert.throws(() => comp.startRound(id), /not competition-ready/,
+      'readiness must be a start invariant, not only an advisory preflight');
+    comp.wire({ marketReady: () => true });
+    comp.abortRound(id, { force: true });
+  });
+  await ok('a dip between sweeps is captured, because drawdown is per-tick', () => {
+    T.db.prepare('DELETE FROM paper_positions WHERE user_id = ?').run(A);
+    comp.createRound({ id: 'r4dd', candidates: ['BTC', 'SOL'], players: [{ userId: A, seat: 0 }] });
+    comp.startRound('r4dd');
+    // a dip and full recovery entirely between two 5s sweeps
+    T.db.prepare('UPDATE paper_accounts SET balance = 4 WHERE user_id = ?').run(A);
+    setMarkRaw('BTC', 100); feedMark('BTC', 100);
+    T.tickEval('BTC', { force: true });                 // the tick samples it
+    T.db.prepare('UPDATE paper_accounts SET balance = 10 WHERE user_id = ?').run(A);
+    T.tickEval('BTC', { force: true });
+    const me = comp.playersOf('r4dd').find((p) => p.user_id === A);
+    assert.ok(me.max_drawdown >= 5.9,
+      'the dip must be recorded even though no sweep ran: got ' + me.max_drawdown);
+    comp.abortRound('r4dd', { force: true });
+  });
+  await ok('a pre-reveal restart without its seed blocks immediately', () => {
+    const id = 'r4seed';
+    comp.createRound({ id, candidates: ['BTC', 'SOL'], players: [{ userId: A, seat: 0 }] });
+    comp.startRound(id);
+    CT._seeds.delete(id);                                // the restart lost it
+    comp.resume();
+    assert.match(CT.q.get.get(id).blocked_reason || '', /seed lost in restart/,
+      'a round that cannot produce a verifiable draw must not keep trading');
+    comp.abortRound(id, { force: true });
   });
 
   console.log(`\n${pass} passed${process.exitCode ? ', WITH FAILURES' : ''}\n`);

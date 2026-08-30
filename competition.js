@@ -36,6 +36,10 @@ const ROUND_PLAN = {
 /* Leverage ceiling on ordinary tickers while a round is running. Boost is the
  * only way past it, and only on a -BOOST twin during the Boost phase. */
 const COMP_BASE_LEV = 100;
+/* How long a drawn Hot Market gets to become priceable before the backup is
+   used. Long enough to ride out an oracle pause, short enough that the
+   segment still starts on time. */
+const HOT_OPEN_GRACE_MS = Number(process.env.PAPER_HOT_OPEN_GRACE_MS || 3000);
 
 db.exec(`
   CREATE TABLE IF NOT EXISTS paper_rounds (
@@ -201,6 +205,7 @@ let hooks = {
   prepareSeat: () => null,
   seatState: () => null,
   equityOf: () => Number.NaN,
+  marketReady: () => true,
   // canonical mark set for a roster's exposure, as of a timestamp
   markSetFor: () => ({}),
 };
@@ -334,6 +339,19 @@ function startRound(id, { at = Date.now(), prepare = true } = {}) {
   if (r.blocked_reason) throw new Error(`round ${id} is blocked: ${r.blocked_reason}`);
   const players = q.players.all(id);
   if (!players.length) throw new Error('cannot start a round with no players');
+  /* Market readiness is checked HERE, not only in the preflight endpoint.
+     Preflight is a preview an operator can skip; a round that starts on
+     markets it cannot price strictly will simply block at its first
+     checkpoint, in front of an audience. */
+  const need = [...new Set([
+    ...JSON.parse(r.hot_candidates || '[]'),
+    ...(r.hot_backup ? [r.hot_backup] : []),
+    ...boostMarketsOf(r),
+  ])];
+  const unready = need.filter((sym) => !hooks.marketReady(sym));
+  if (unready.length) {
+    throw new Error(`markets not competition-ready: ${unready.join(', ')}`);
+  }
 
   /* Reset, bind the epoch and go live in ONE transaction. If any seat cannot
      be prepared the round does not start at all, rather than starting with
@@ -369,9 +387,19 @@ function startRound(id, { at = Date.now(), prepare = true } = {}) {
   return q.get.get(id);
 }
 
-function abortRound(id) {
-  const r = q.get.get(id);
+function abortRound(id, { force = false } = {}) {
+  /* Settle anything already due BEFORE aborting. A late timer or a busy event
+     loop otherwise leaves a window where an ordinary abort discards a result
+     the round had already earned. */
+  try { advanceRoundClock(Date.now()); } catch { /* fall through to the checks */ }
+  let r = q.get.get(id);
   if (!r) throw new Error('no such round: ' + id);
+  if (r.status === 'done' && !force) {
+    throw new Error(`round ${id} settled while aborting; refusing to discard a published result`);
+  }
+  if (r.blocked_reason && !force) {
+    throw new Error(`round ${id} is blocked (${r.blocked_reason}); use forceAbort with a reason`);
+  }
   /* done and aborted are final. Rewriting a completed round's status would
      mutate a published result's provenance after the fact. */
   if (r.status === 'done' || r.status === 'aborted') {
@@ -422,8 +450,17 @@ function clearBlock(id, { note = '' } = {}) {
     return after;
   }
   if (after.status === 'running') {
-    rehydrateGates(after);        // put the segment gates back where the phase says
-    schedule(id);                 // and re-arm only the boundaries still ahead
+    /* The return value matters: previously it was discarded, so recovery
+       reported success with a required segment ticker still shut. */
+    const missing = rehydrateGates(after);
+    if (missing.length) {
+      const why = `required segment ticker(s) still unavailable: ${missing.join(', ')}`;
+      q.setBlocked.run(why, Date.now(), id);
+      hooks.log(`round ${id} recovery INCOMPLETE: ${why}`);
+      hooks.onPhase('round:blocked', q.get.get(id));
+      return q.get.get(id);
+    }
+    schedule(id);                 // re-arm only the boundaries still ahead
   }
   hooks.log(`round ${id} RECOVERED by operator${note ? ': ' + note : ''}`);
   hooks.onPhase('round:unblocked', after);
@@ -502,6 +539,29 @@ function schedule(id) {
   _timers.set(id, ts);
 }
 
+/* Which boundaries can still be honestly executed, and which are windows
+   that have simply been missed.
+ *
+ * Replaying everything merely "due" let recovery open a Hot segment after its
+ * window had closed, shut it immediately, and record BOTH boundaries as
+ * succeeded. The durable record then claimed a four-minute segment that never
+ * took place. Opening a window is only meaningful while the window is open;
+ * settling and scoring can always be retried, because they price a moment
+ * that has already passed.
+ */
+function boundaryPolicy(kind, at) {
+  const p = ROUND_PLAN[kind];
+  if (at === p.hotStart) return { window: 'hot', label: 'Hot open' };
+  if (at === p.boostStart) return { window: 'boost', label: 'Boost open' };
+  return { window: null, label: 'settlement' };   // firstFive, reveal, hotEnd, bell
+}
+/* Is the phase this boundary opens still live? */
+function windowStillOpen(r, at, now = Date.now()) {
+  const pol = boundaryPolicy(r.kind, at);
+  if (!pol.window) return true;
+  return phaseAt(r.kind, now - r.started_at).phase === pol.window;
+}
+
 /* A boundary runs at most once SUCCESSFULLY. Marking it fired before the
    action ran meant a transient failure was permanent within the process and
    invisible after a restart; now the durable status decides, so a failed
@@ -520,6 +580,17 @@ function fireBoundary(id, at) {
     return;
   }
   const p = ROUND_PLAN[r.kind];
+  /* Refuse to "open" a segment whose window has gone. Better a recorded gap
+     than a fabricated segment. */
+  if (!windowStillOpen(r, at)) {
+    const pol = boundaryPolicy(r.kind, at);
+    const why = `${pol.label} boundary ${at} missed: its window has closed`;
+    q.bMark.run(id, at, 'missed', why, Date.now());
+    q.setBlocked.run(why, Date.now(), id);
+    hooks.log(`round ${id} BLOCKED: ${why}`);
+    hooks.onPhase('round:blocked', q.get.get(id));
+    return;
+  }
   q.bMark.run(id, at, 'running', null, Date.now());
   try {
     const dueAt = r.started_at + at;      // when this boundary was scheduled
@@ -585,10 +656,28 @@ function openHot(id) {
   let used, why = null;
   try { used = tryOpen(r.hot_base); }
   catch (e) {
-    if (!r.hot_backup) throw e;
-    why = `${r.hot_base} could not open: ${e.message}`;
-    hooks.log(`round ${id} hot open failed on ${r.hot_base}, using backup ${r.hot_backup} (${e.message})`);
-    used = tryOpen(r.hot_backup);
+    /* Do NOT fall back on a blip. Index readiness is momentary: a component
+       can lag past its 5s freshness window for a second while the oracle
+       price is still fine, and observed live on 2026-08-30 that was enough to
+       swap a drawn ETH for the backup. Changing which market the show trades
+       is a big, visible act; it must follow a real outage, not a hiccup.
+       Retry briefly first, synchronously, because the segment is already due. */
+    let lastErr = e;
+    const deadline = Date.now() + HOT_OPEN_GRACE_MS;
+    while (Date.now() < deadline) {
+      const t = Date.now() + 250;
+      while (Date.now() < t) { /* short spin: the boundary is due now */ }
+      try { used = tryOpen(r.hot_base); lastErr = null; break; }
+      catch (e2) { lastErr = e2; }
+    }
+    if (lastErr) {
+      if (!r.hot_backup) throw lastErr;
+      why = `${r.hot_base} could not open after ${HOT_OPEN_GRACE_MS}ms: ${lastErr.message}`;
+      hooks.log(`round ${id} hot open failed on ${r.hot_base}, using backup ${r.hot_backup} (${lastErr.message})`);
+      used = tryOpen(r.hot_backup);
+    } else {
+      hooks.log(`round ${id} hot open recovered on ${r.hot_base} after a brief unready window`);
+    }
   }
   // record what TRADED; the drawn result stays untouched so the proof holds
   q.setActive.run(used, why, Date.now(), id);
@@ -929,6 +1018,18 @@ function resume() {
   if (r.blocked_reason) {
     hooks.log(`round ${r.id} resumed BLOCKED: ${r.blocked_reason}`);
     return r;
+  }
+
+  /* A round that has not drawn yet and whose committed seed died with the
+     previous process can never produce a verifiable Hot Market. Block now
+     rather than letting people trade for minutes into a reveal that cannot
+     happen. */
+  if (!r.hot_base && !_seeds.has(r.id)) {
+    const why = 'committed draw seed lost in restart; no verifiable draw is possible';
+    q.setBlocked.run(why, Date.now(), r.id);
+    hooks.log(`round ${r.id} BLOCKED on resume: ${why}`);
+    hooks.onPhase('round:blocked', q.get.get(r.id));
+    return q.get.get(r.id);
   }
 
   /* If the process was away across a boundary that has not run, the round

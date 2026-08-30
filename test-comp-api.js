@@ -24,6 +24,16 @@ const comp = require('./competition.js');
 const P = require('./paper.js');
 const T = P.__test;
 const CT = comp.__test;
+
+/* Fire a boundary the way the clock would: wind the round so the boundary is
+   genuinely due, then fire it. Firing a segment-opening boundary while the
+   phase says otherwise is not something that can happen in production, and
+   the engine now refuses it rather than fabricating a segment. */
+const fireAt = (id, at) => {
+  CT.db.prepare('UPDATE paper_rounds SET started_at = ? WHERE id = ?')
+    .run(Date.now() - at - 200, id);
+  CT.fireBoundary(id, at);
+};
 const { ROUND_PLAN } = comp;
 const TOKEN = process.env.PAPER_COMP_TOKEN;
 
@@ -101,7 +111,7 @@ for (const s of ['BTC', 'SOL', 'ETH', 'BNB', 'XRP']) {
   // what stage pricing and strict checkpoints now require
   T.compUpdate(s, 'usdt', 100, now); T.compUpdate(s, 'usd', 100, now);
   // a short trail so any boundary instant has a mark at or before it
-  for (let back = 20_000; back >= 0; back -= 2_000) T.recordMark(s, 100, now - back);
+  for (let back = 20_000; back >= 0; back -= 2_000) T.recordMark(s, 100, now - back, 2);
 }
 comp.wire({
   openAlias: T.openAlias, closeAlias: T.closeAlias, scoreUser: T.scoreUser,
@@ -204,7 +214,7 @@ for (const uid of SEATS) {
 
   console.log('\ndraw and segments');
   warpTo('e2e', ROUND_PLAN.round.reveal + 1000);
-  CT.fireBoundary('e2e', ROUND_PLAN.round.reveal);
+  fireAt('e2e', ROUND_PLAN.round.reveal);
   st = state();
   await ok('after the reveal the market is public but not yet tradable', () => {
     assert.ok(st.hot && st.hot.market, 'market should be revealed');
@@ -218,16 +228,16 @@ for (const uid of SEATS) {
     assert.ok(v.seed && v.commit, 'seed and commitment both published');
   });
   warpTo('e2e', ROUND_PLAN.round.hotStart + 1000);
-  CT.fireBoundary('e2e', ROUND_PLAN.round.hotStart);
+  fireAt('e2e', ROUND_PLAN.round.hotStart);
   await ok('the hot ticker opens on its boundary', () => {
     assert.strictEqual(state().hot.open, true);
     assert.strictEqual(state().phase, 'hot');
   });
   warpTo('e2e', ROUND_PLAN.round.hotEnd + 1000);
-  CT.fireBoundary('e2e', ROUND_PLAN.round.hotEnd);
+  fireAt('e2e', ROUND_PLAN.round.hotEnd);
   await ok('and closes again', () => assert.strictEqual(state().hot.open, false));
   warpTo('e2e', ROUND_PLAN.round.boostStart + 1000);
-  CT.fireBoundary('e2e', ROUND_PLAN.round.boostStart);
+  fireAt('e2e', ROUND_PLAN.round.boostStart);
   await ok('boost shows as open on the wall', () => {
     const s = state();
     assert.strictEqual(s.phase, 'boost');
@@ -245,7 +255,7 @@ for (const uid of SEATS) {
 
   console.log('\nbell');
   warpTo('e2e', ROUND_PLAN.round.total + 1000);
-  CT.fireBoundary('e2e', ROUND_PLAN.round.total);
+  fireAt('e2e', ROUND_PLAN.round.total);
   await ok('the round leaves live state when it ends', () => assert.strictEqual(state().live, false));
   r = await admin({ action: 'standings', id: 'e2e', checkpoint: 'final', token: TOKEN });
   await ok('final standings are readable and ranked', () => {

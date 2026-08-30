@@ -23,7 +23,7 @@ New in this snapshot:
 | `competition.js` | Round clock, phase gate, verifiable market draw, scoring. Entirely new. |
 | `paper.js` | Engine. New: alias tickers, the order-path gate, `scoreUser`, the competition HTTP handlers. Everything else predates this work. |
 | `server.js` | HTTP routing. Three new routes. |
-| `test-*.js` | 149 assertions, all passing. |
+| `test-*.js` | 164 assertions; all six suites exit zero. |
 | `test-integrity.js` | **New.** One case per blocker from the first review round. Adversarial rather than functional: nothing here describes what a well-behaved player does, and all of it changes a published result if it regresses. |
 
 ---
@@ -139,6 +139,47 @@ All ten reported ship blockers are closed, each with a regression test in
 `startRound` now also resets every seat and binds the scoring epoch to the
 roster row, so preflight and reset are no longer optional buttons and scoring
 cannot change basis mid-round.
+
+## Fixed since the fourth review
+
+All seven P0s and the P1s are closed, each with a regression.
+
+**Ordering.** `placeOrder` advances the round clock before any gate decision,
+so an order can be the event that opens its own segment when a timer is late.
+After the await the **barrier runs first**, then the gate and leverage
+re-checks, closing the window where a fill landed on a ticker the barrier had
+just closed.
+
+**Competition-valid prices.** Mark history carries the component count with
+every observation. A strict lookup requires two sources *at that observation*,
+and every `markFor` call passes its symbol so readiness cannot be skipped. A
+one-source tick is invisible to strict pricing, competition risk and
+checkpoints, while remaining available to the public product.
+
+**Barrier coverage.** `evalCrossForUser`, both liquidators and the delist close
+now consult it, so a blocked account cannot be liquidated by an incoming tick.
+
+**Hot settlement** is strict at the scheduled mark, and the generated fill is
+stamped with the **boundary instant** rather than recovery time, fixing the
+case where a recovered Hot fill was excluded by its own `ts <= scheduledAt`
+filter and silently paid 1x on a 2x segment.
+
+**Recovery is boundary-aware.** A segment whose window has closed is recorded
+`missed` and blocks, instead of being opened, immediately shut and marked
+succeeded. Failed gate restoration blocks rather than reporting recovery.
+
+**Abort** advances the clock first and refuses to discard a settled result;
+a blocked round needs a separately named, audited `forceAbort` with a reason.
+
+**Stage resting limits** are fully branched from the venue path: they trigger
+on the competition composite and fill at the limit price, never consulting
+Phoenix prints or the venue mark.
+
+**P1s.** Market readiness is enforced at `startRound`, not only in preflight.
+Drawdown samples on every accepted tick, so a dip between sweeps cannot hide
+from a published tie-break. A pre-reveal restart that lost its seed blocks
+immediately. The three remaining suites now await every case and assert that
+the expected number ran.
 
 ## Fixed since the second review
 
