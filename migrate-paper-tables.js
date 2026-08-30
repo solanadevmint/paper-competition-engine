@@ -25,7 +25,14 @@ for (const t of tables) {
   const ddl = out.prepare("SELECT sql FROM legacy.sqlite_master WHERE name = ?").get(t).sql;
   out.exec(`DROP TABLE IF EXISTS main.${t}`);
   out.exec(ddl);
-  out.exec(`INSERT OR IGNORE INTO main.users (id) SELECT DISTINCT user_id FROM legacy.${t}`);
+  /* Only tables that actually carry a user_id can seed the FK stub. The
+     competition tables (paper_rounds, paper_round_boundaries,
+     paper_operator_log) do not, and an unconditional SELECT user_id aborted
+     the migration after the first compatible table. */
+  const cols = out.prepare(`PRAGMA legacy.table_info(${t})`).all().map((c) => c.name);
+  if (cols.includes('user_id')) {
+    out.exec(`INSERT OR IGNORE INTO main.users (id) SELECT DISTINCT user_id FROM legacy.${t} WHERE user_id IS NOT NULL`);
+  }
   out.exec(`INSERT INTO main.${t} SELECT * FROM legacy.${t}`);
   const n = out.prepare(`SELECT count(*) c FROM main.${t}`).get().c;
   console.log(`${t}: ${n} rows`);

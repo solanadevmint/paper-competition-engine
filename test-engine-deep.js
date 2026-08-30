@@ -27,9 +27,21 @@ const CT = comp.__test;
 const { ROUND_PLAN } = comp;
 
 let pass = 0;
+/* Names the in-flight test if the suite stalls. A hung suite otherwise just
+   stops printing, and the last successful line is a misleading place to look. */
+let _inflight = null;
+const _watchdog = setInterval(() => {
+  if (_inflight && Date.now() - _inflight.at > 15_000) {
+    console.log(`  STALL  ${_inflight.name} (no return after 15s)`);
+    process.exit(3);
+  }
+}, 1000);
+_watchdog.unref?.();
 const ok = async (name, fn) => {
+  _inflight = { name, at: Date.now() };
   try { await fn(); console.log('  ok   ' + name); pass++; }
   catch (e) { console.log('  FAIL ' + name + '\n       ' + e.message); process.exitCode = 1; }
+  finally { _inflight = null; }
 };
 const near = (a, b, eps = 1e-6) => Math.abs(a - b) < eps;
 
@@ -54,15 +66,31 @@ const order = async (body) => {
   return res;
 };
 
-const setMark = (sym, px) => T.live.map.set(sym, {
+const setMarkRaw = (sym, px) => T.live.map.set(sym, {
   markPrice: px, pythPrice: px, pythAtMs: Date.now(), pythBasis: 0,
   lastUpdatedMs: Date.now(), indexHalt: false, currentFundingRate: 0,
 });
+
+/* Fixtures must look like a HEALTHY index, not just a populated map. Stage
+   pricing now requires a fresh composite from at least two agreeing
+   components while a round is live, and checkpoints price strictly from
+   recorded history, so a fixture that only wrote live.map was pretending to
+   be a market it was not. */
+function feedMark(sym, px, t = Date.now()) {
+  T.compUpdate(sym, 'usdt', px, t);
+  T.compUpdate(sym, 'usd', px, t);
+  /* A real index ticks continuously, so any boundary instant has a mark at or
+     before it. A fixture that records ONE sample at "now" has no history
+     behind it, and a suite fast enough to fire a boundary within the same
+     second finds nothing to price from. Seed a short trail. */
+  for (let back = 20_000; back > 0; back -= 2_000) T.recordMark(sym, px, t - back);
+  T.recordMark(sym, px, t);
+}
 const CFG = {
   tiers: [], maxLev: 40, lotSize: null, takerBps: 3.5, makerBps: 0.5,
   maintBps: 50, cancelBps: 0, maxLiqSize: null, status: 'active', isolatedOnly: false,
 };
-for (const s of ['BTC', 'SOL', 'ETH', 'BNB', 'XRP']) { setMark(s, 100); T.mktCfg.set(s, { ...CFG }); }
+for (const s of ['BTC', 'SOL', 'ETH', 'BNB', 'XRP']) { setMarkRaw(s, 100); feedMark(s, 100); T.mktCfg.set(s, { ...CFG }); }
 
 comp.wire({
   openAlias: T.openAlias, closeAlias: T.closeAlias, scoreUser: T.scoreUser,
@@ -102,10 +130,10 @@ const balOf = (uid) => T.stmt.acctGet.get(uid).balance;
   });
   await ok('profit is banked exactly', async () => {
     await order({ symbol: 'BTC', side: 'BUY', type: 'MARKET', size: 0.01, leverage: 10 });
-    setMark('BTC', 110);                       // +10 on 0.01 units = +0.10
+    setMarkRaw('BTC', 110); feedMark('BTC', 110);                       // +10 on 0.01 units = +0.10
     await order({ symbol: 'BTC', side: 'SELL', type: 'MARKET', size: 0.01, leverage: 10 });
     assert.ok(near(balOf(SPECTATOR), 10.1), `expected 10.1, got ${balOf(SPECTATOR)}`);
-    setMark('BTC', 100);
+    setMarkRaw('BTC', 100); feedMark('BTC', 100);
   });
   await ok('stage leverage is available outside a competition', async () => {
     await order({ symbol: 'BTC', side: 'BUY', type: 'MARKET', size: 0.01, leverage: 1000 });
@@ -168,7 +196,7 @@ const balOf = (uid) => T.stmt.acctGet.get(uid).balance;
     assert.strictEqual(T.mkt(HOT).markPrice, T.mkt(base).markPrice);
   });
   await ok('segment close flattens the hot leg only, and pays the bonus', async () => {
-    setMark(CT.q.get.get('deep').hot_base, 110);   // hot leg +0.10
+    setMarkRaw(CT.q.get.get('deep').hot_base, 110); feedMark(CT.q.get.get('deep').hot_base, 110);   // hot leg +0.10
     warp(ROUND_PLAN.round.hotEnd + 500);
     CT.fireBoundary('deep', ROUND_PLAN.round.hotEnd);
     assert.strictEqual(posOf(PLAYER, HOT), undefined, 'hot leg must be flat');

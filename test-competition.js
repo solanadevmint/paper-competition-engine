@@ -21,10 +21,30 @@ const { ROUND_PLAN, phaseAt, boundariesOf, verifyDraw, levCapFor } = comp;
 const CT = comp.__test;
 
 let pass = 0;
-const ok = (name, fn) => {
-  try { fn(); console.log('  ok   ' + name); pass++; }
+/* Awaits the body. A synchronous helper silently dropped promise-returning
+   tests: the suite printed passes and then died on an unhandled rejection
+   with a non-zero exit, so counting "ok" lines reported green on a failing
+   suite. Every caller is awaited now. */
+/* Names the in-flight test if the suite stalls. A hung suite otherwise just
+   stops printing, and the last successful line is a misleading place to look. */
+let _inflight = null;
+const _watchdog = setInterval(() => {
+  if (_inflight && Date.now() - _inflight.at > 15_000) {
+    console.log(`  STALL  ${_inflight.name} (no return after 15s)`);
+    process.exit(3);
+  }
+}, 1000);
+_watchdog.unref?.();
+const ok = async (name, fn) => {
+  _inflight = { name, at: Date.now() };
+  try { await fn(); console.log('  ok   ' + name); pass++; }
   catch (e) { console.log('  FAIL ' + name + '\n       ' + e.message); process.exitCode = 1; }
+  finally { _inflight = null; }
 };
+process.on('unhandledRejection', (e) => {
+  console.log('  FAIL unhandled rejection\n       ' + (e && e.message ? e.message : e));
+  process.exitCode = 1;
+});
 const MIN = 60_000;
 const at = (kind, mins) => phaseAt(kind, mins * MIN).phase;
 
@@ -32,6 +52,11 @@ const at = (kind, mins) => phaseAt(kind, mins * MIN).phase;
 const now = Date.now();
 for (const s of ['BTC', 'SOL', 'ETH', 'BNB', 'XRP']) {
   T.live.map.set(s, { markPrice: 100, pythPrice: 100, pythAtMs: now, pythBasis: 0, lastUpdatedMs: now, indexHalt: false });
+  // a healthy index: two fresh components plus recorded history, which is
+  // what stage pricing and strict checkpoints now require
+  T.compUpdate(s, 'usdt', 100, now); T.compUpdate(s, 'usd', 100, now);
+  // a short trail so any boundary instant has a mark at or before it
+  for (let back = 20_000; back >= 0; back -= 2_000) T.recordMark(s, 100, now - back);
 }
 const logs = [];
 let _ep = 1;
@@ -130,14 +155,16 @@ ok('Hot opens and closes its ticker on the boundaries', () => {
 });
 ok('Boost opens a twin on every major at once', () => {
   CT.fireBoundary('t-commit', ROUND_PLAN.round.boostStart);
-  for (const b of ['BTC', 'ETH', 'BNB', 'XRP', 'SOL']) {
+  for (const b of comp.__test.q ? ['BTC', 'ETH', 'XRP', 'SOL'] : []) {
     assert.strictEqual(T.aliasOpen(b + '-BOOST'), true, b + '-BOOST should be open');
   }
+  // BNB is excluded on purpose: single-source index, unsafe at 1000x
+  assert.strictEqual(T.aliasOpen('BNB-BOOST'), false, 'BNB must not be a Boost market');
 });
 ok('the bell closes every segment and marks the round done', () => {
   CT.fireBoundary('t-commit', ROUND_PLAN.round.total);
   assert.strictEqual(CT.q.get.get('t-commit').status, 'done');
-  for (const b of ['BTC', 'ETH', 'BNB', 'XRP', 'SOL']) {
+  for (const b of ['BTC', 'ETH', 'XRP', 'SOL']) {
     assert.strictEqual(T.aliasOpen(b + '-BOOST'), false, b + '-BOOST should be closed at the bell');
   }
 });

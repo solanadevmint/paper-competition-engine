@@ -25,6 +25,12 @@ const MIN = 60_000;
 const ROUND_PLAN = {
   round: { total: 30 * MIN, firstFive: 5 * MIN, reveal: 11.75 * MIN, hotStart: 12 * MIN, hotEnd: 16 * MIN, boostStart: 27 * MIN },
   final: { total: 20 * MIN, firstFive: 4 * MIN, reveal: 7.75 * MIN, hotStart: 8 * MIN, hotEnd: 11 * MIN, boostStart: 17 * MIN },
+  /* A compressed round with the same five beats in the same order, for
+     rehearsal and fault injection. A restart-during-Hot drill is not worth
+     doing if each attempt costs thirty minutes, and a drill nobody repeats is
+     one nobody trusts. Never use this for a real show: the phases are far too
+     short to trade. */
+  rehearsal: { total: 180_000, firstFive: 30_000, reveal: 65_000, hotStart: 70_000, hotEnd: 100_000, boostStart: 150_000 },
 };
 
 /* Leverage ceiling on ordinary tickers while a round is running. Boost is the
@@ -34,7 +40,7 @@ const COMP_BASE_LEV = 100;
 db.exec(`
   CREATE TABLE IF NOT EXISTS paper_rounds (
     id             TEXT PRIMARY KEY,
-    kind           TEXT    NOT NULL CHECK (kind IN ('round','final')),
+    kind           TEXT    NOT NULL CHECK (kind IN ('round','final','rehearsal')),
     status         TEXT    NOT NULL CHECK (status IN ('armed','running','done','aborted')),
     started_at     INTEGER,
     ends_at        INTEGER,
@@ -114,10 +120,41 @@ for (const alter of [
      nothing measured it, so the rule could not actually be applied. */
   'ALTER TABLE paper_round_players ADD COLUMN peak_equity REAL',
   'ALTER TABLE paper_round_players ADD COLUMN max_drawdown REAL',
+  /* Frozen with the checkpoint. Reading the roster's live value meant a
+     published First Five order could change later in the round, because a
+     dip after the checkpoint rewrote the tie-break behind it. */
+  'ALTER TABLE paper_round_scores ADD COLUMN max_drawdown REAL',
   'ALTER TABLE paper_rounds ADD COLUMN fallback_reason TEXT',
 ]) {
   try { db.exec(alter); } catch { /* already applied */ }
 }
+
+/* A CHECK constraint cannot be altered in place, so a database created before
+   the rehearsal kind existed would reject it. Rebuild that one table, in a
+   transaction, only when the old constraint is actually present. */
+try {
+  const ddl = db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='paper_rounds'").get();
+  if (ddl && ddl.sql && !ddl.sql.includes("'rehearsal'")) {
+    db.transaction(() => {
+      db.exec('ALTER TABLE paper_rounds RENAME TO paper_rounds_old');
+      db.exec(`CREATE TABLE paper_rounds (
+        id TEXT PRIMARY KEY,
+        kind TEXT NOT NULL CHECK (kind IN ('round','final','rehearsal')),
+        status TEXT NOT NULL CHECK (status IN ('armed','running','done','aborted')),
+        started_at INTEGER, ends_at INTEGER,
+        hot_candidates TEXT NOT NULL, hot_backup TEXT, hot_base TEXT,
+        draw_commit TEXT NOT NULL, draw_seed TEXT, draw_at INTEGER,
+        created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
+        blocked_reason TEXT, active_hot_base TEXT, boost_markets TEXT, fallback_reason TEXT)`);
+      const cols = db.prepare('PRAGMA table_info(paper_rounds_old)').all().map((c) => c.name);
+      const shared = ['id','kind','status','started_at','ends_at','hot_candidates','hot_backup','hot_base',
+        'draw_commit','draw_seed','draw_at','created_at','updated_at','blocked_reason','active_hot_base',
+        'boost_markets','fallback_reason'].filter((c) => cols.includes(c));
+      db.exec(`INSERT INTO paper_rounds (${shared.join(',')}) SELECT ${shared.join(',')} FROM paper_rounds_old`);
+      db.exec('DROP TABLE paper_rounds_old');
+    })();
+  }
+} catch (e) { /* a fresh database already has the current shape */ }
 
 const q = {
   ins: db.prepare(`INSERT INTO paper_rounds (id, kind, status, hot_candidates, hot_backup, draw_commit, created_at, updated_at)
@@ -128,7 +165,7 @@ const q = {
   setActive: db.prepare('UPDATE paper_rounds SET active_hot_base = ?, fallback_reason = ?, updated_at = ? WHERE id = ?'),
   get: db.prepare('SELECT * FROM paper_rounds WHERE id = ?'),
   running: db.prepare("SELECT * FROM paper_rounds WHERE status = 'running' ORDER BY started_at DESC LIMIT 1"),
-  playerIns: db.prepare('INSERT OR REPLACE INTO paper_round_players (round_id, user_id, display_name, seat) VALUES (?, ?, ?, ?)'),
+  playerIns: db.prepare('INSERT INTO paper_round_players (round_id, user_id, display_name, seat) VALUES (?, ?, ?, ?)'),
   players: db.prepare('SELECT * FROM paper_round_players WHERE round_id = ? ORDER BY seat'),
   bindEpoch: db.prepare('UPDATE paper_round_players SET epoch = ? WHERE round_id = ? AND user_id = ?'),
   ddUpd: db.prepare('UPDATE paper_round_players SET peak_equity = ?, max_drawdown = ? WHERE round_id = ? AND user_id = ?'),
@@ -143,9 +180,10 @@ const q = {
   bGet: db.prepare('SELECT * FROM paper_round_boundaries WHERE round_id = ? AND at = ?'),
   bAll: db.prepare('SELECT * FROM paper_round_boundaries WHERE round_id = ? ORDER BY at'),
   setBlocked: db.prepare('UPDATE paper_rounds SET blocked_reason = ?, updated_at = ? WHERE id = ?'),
+  setBoostOpened: db.prepare('UPDATE paper_rounds SET boost_markets = ?, updated_at = ? WHERE id = ?'),
   scoreInsStrict: db.prepare(`INSERT INTO paper_round_scores
-                        (round_id, user_id, checkpoint, at, equity, account_pnl, realized, hot_bonus, score, marks, scheduled_at)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`),
+                        (round_id, user_id, checkpoint, at, equity, account_pnl, realized, hot_bonus, score, marks, scheduled_at, max_drawdown)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`),
   scoreIns: db.prepare(`INSERT OR IGNORE INTO paper_round_scores
                         (round_id, user_id, checkpoint, at, equity, account_pnl, realized, hot_bonus, score)
                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`),
@@ -224,13 +262,25 @@ function createRound({ id, kind = 'round', candidates, backup = null, players = 
   if (!Array.isArray(candidates) || candidates.length < 2) throw new Error('need at least 2 hot candidates');
   /* Validate the whole show constraint before anything is written. A round
      that half-exists is worse than one that failed to arm. */
+  /* Normalise BEFORE validating. new Set([1, "1"]) sees two values while the
+     integer column sees one, so a roster of 1 and "1" passed the duplicate
+     check and then collapsed into a single seat. */
+  candidates = candidates.map((c) => String(c).trim().toUpperCase()).filter(Boolean);
+  backup = backup ? String(backup).trim().toUpperCase() : null;
+  players = players.map((p, i) => ({
+    userId: Number(p.userId),
+    displayName: p.displayName == null ? null : String(p.displayName).slice(0, 40),
+    seat: Number(p.seat ?? i),
+  }));
+
   const uniq = new Set(candidates);
   if (uniq.size !== candidates.length) throw new Error('duplicate hot candidates');
   if (backup && uniq.has(backup)) throw new Error('backup must not also be a candidate');
-  const seats = players.map((p, i) => p.seat ?? i);
+  const seats = players.map((p) => p.seat);
+  if (seats.some((x) => !Number.isInteger(x) || x < 0)) throw new Error('seats must be non-negative integers');
   if (new Set(seats).size !== seats.length) throw new Error('duplicate seats');
   const uids = players.map((p) => p.userId);
-  if (uids.some((u) => !Number.isFinite(Number(u)))) throw new Error('every player needs a numeric userId');
+  if (uids.some((u) => !Number.isSafeInteger(u) || u <= 0)) throw new Error('every player needs a positive integer userId');
   if (new Set(uids).size !== uids.length) throw new Error('duplicate players');
 
   const now = Date.now();
@@ -244,7 +294,7 @@ function createRound({ id, kind = 'round', candidates, backup = null, players = 
     q.ins.run(id, kind, JSON.stringify(candidates), backup, commit, now, now);
     db.prepare('UPDATE paper_rounds SET boost_markets = ? WHERE id = ?')
       .run(JSON.stringify(BOOST_MARKETS), id);
-    players.forEach((p, i) => q.playerIns.run(id, p.userId, p.displayName || null, p.seat ?? i));
+    players.forEach((p) => q.playerIns.run(id, p.userId, p.displayName, p.seat));
   });
   write();
   _seeds.set(id, seed);
@@ -302,8 +352,13 @@ function startRound(id, { at = Date.now(), prepare = true } = {}) {
       }
       if (!prep.stage) throw new Error(`seat ${p.user_id} is not in stage mode`);
       q.bindEpoch.run(prep.epoch, id, p.user_id);
-      db.prepare('UPDATE paper_round_players SET start_balance = ? WHERE round_id = ? AND user_id = ?')
-        .run(prep.startBalance, id, p.user_id);
+      /* Peak starts at the bankroll, not at whatever the first sample sees.
+         Initialising lazily meant an opening loss became the peak and the
+         drawdown it caused vanished. */
+      db.prepare(`UPDATE paper_round_players
+                  SET start_balance = ?, peak_equity = ?, max_drawdown = 0
+                  WHERE round_id = ? AND user_id = ?`)
+        .run(prep.startBalance, prep.startBalance, id, p.user_id);
     }
     q.start.run('running', at, ends, Date.now(), id);
   });
@@ -317,6 +372,11 @@ function startRound(id, { at = Date.now(), prepare = true } = {}) {
 function abortRound(id) {
   const r = q.get.get(id);
   if (!r) throw new Error('no such round: ' + id);
+  /* done and aborted are final. Rewriting a completed round's status would
+     mutate a published result's provenance after the fact. */
+  if (r.status === 'done' || r.status === 'aborted') {
+    throw new Error(`round ${id} is ${r.status}; finished rounds are immutable`);
+  }
   clearTimers(id);
   /* An armed round has never opened a ticker. Closing "its" aliases used to
      reach into whatever round actually owned them, so aborting a future round
@@ -338,13 +398,36 @@ function clearBlock(id, { note = '' } = {}) {
   const r = q.get.get(id);
   if (!r) throw new Error('no such round: ' + id);
   if (!r.blocked_reason) return r;
+
+  /* Recovery RETRIES, it does not merely unlock. Clearing the flag and hoping
+     a later timer finished the job left rounds "unblocked but inert": the
+     failed boundary never ran, so the checkpoint it owed never existed while
+     the round looked healthy again.
+     The block is lifted first so the retry can run, and re-applied by
+     fireBoundary itself if the cause has not actually been fixed. */
+  const was = r.blocked_reason;
   db.transaction(() => {
     db.prepare("UPDATE paper_round_boundaries SET status = 'retryable' WHERE round_id = ? AND status = 'failed'").run(id);
     q.setBlocked.run(null, Date.now(), id);
   })();
-  hooks.log(`round ${id} UNBLOCKED by operator${note ? ': ' + note : ''} (was: ${r.blocked_reason})`);
-  hooks.onPhase('round:unblocked', q.get.get(id));
-  return q.get.get(id);
+  hooks.log(`round ${id} recovery attempt${note ? ' (' + note + ')' : ''}, was: ${was}`);
+
+  // replay every boundary that is due and unresolved, oldest first
+  advanceRoundClock(Date.now());
+
+  const after = q.get.get(id);
+  if (after.blocked_reason) {
+    hooks.log(`round ${id} recovery FAILED, still blocked: ${after.blocked_reason}`);
+    hooks.onPhase('round:blocked', after);
+    return after;
+  }
+  if (after.status === 'running') {
+    rehydrateGates(after);        // put the segment gates back where the phase says
+    schedule(id);                 // and re-arm only the boundaries still ahead
+  }
+  hooks.log(`round ${id} RECOVERED by operator${note ? ': ' + note : ''}`);
+  hooks.onPhase('round:unblocked', after);
+  return after;
 }
 
 /** Is this account owned by a show right now? True from the moment a player
@@ -367,6 +450,7 @@ function settledFor(userId, now = Date.now()) {
  *  a resting order could fill after the result was frozen. Returns a reason
  *  string when writes are barred, or null when they are allowed. */
 function writeBarrier(userId, now = Date.now()) {
+  advanceRoundClock(now);
   const r = currentRound();
   if (!r || !r.started_at || !inRound(userId, r)) return null;
   if (r.blocked_reason) return 'round_blocked';
@@ -376,6 +460,17 @@ function writeBarrier(userId, now = Date.now()) {
 
 const accountLocked = (userId) =>
   userId != null && !!q.liveForUser.get(Number(userId));
+
+/** Rounds, other than `exceptId`, that currently own this account. Used to
+ *  stop a FUTURE armed round from preparing a player who is live in another
+ *  one: resetting them there restored the bankroll and bumped the epoch out
+ *  from under a running result. */
+function otherRoundsOwning(userId, exceptId) {
+  return db.prepare(`SELECT r.id, r.status FROM paper_round_players p
+                     JOIN paper_rounds r ON r.id = p.round_id
+                     WHERE p.user_id = ? AND r.id != ? AND r.status IN ('running')`)
+    .all(Number(userId), exceptId);
+}
 const playersOf = (id) => q.players.all(id);
 
 // ── scheduling ───────────────────────────────────────────────────────────
@@ -396,7 +491,13 @@ function schedule(id) {
   for (const at of boundariesOf(r.kind)) {
     const delay = r.started_at + at - Date.now();
     if (delay <= 0) { fireBoundary(id, at); continue; }
-    ts.push(setTimeout(() => fireBoundary(id, at), delay));
+    const t = setTimeout(() => fireBoundary(id, at), delay);
+    /* Do not hold the process open on our account. The engine is a long-lived
+       server that stays alive regardless, and the clock is advanced by events
+       anyway; an unreffed timer means a stray round can never keep a script
+       (or a test run) alive for the length of a round. */
+    t.unref?.();
+    ts.push(t);
   }
   _timers.set(id, ts);
 }
@@ -425,20 +526,32 @@ function fireBoundary(id, at) {
     if (at === p.firstFive) { snapshot(id, 'firstFive', dueAt); }
     else if (at === p.reveal) { drawHotMarket(id); }
     else if (at === p.hotStart) { openHot(id); }
-    else if (at === p.hotEnd) { closeHot(id); }
+    else if (at === p.hotEnd) { closeHot(id, dueAt); }
     else if (at === p.boostStart) { openBoost(id); }
     else if (at === p.total) { bell(id, dueAt); }
     q.bMark.run(id, at, 'succeeded', null, Date.now());
   } catch (e) {
     q.bMark.run(id, at, 'failed', String(e.message).slice(0, 500), Date.now());
-    hooks.log(`round ${id} boundary ${at} FAILED: ${e.message}`);
-    hooks.onPhase('boundary:failed', { ...r, boundary: at, error: e.message });
+    /* Every boundary in this format is REQUIRED: First Five, the draw, Hot
+       open and close, Boost open and the bell all decide or enable part of
+       the result. A failure that merely logged let the show carry on past a
+       segment that never happened. */
+    q.setBlocked.run(`boundary ${at} failed: ${e.message}`.slice(0, 400), Date.now(), id);
+    hooks.log(`round ${id} BLOCKED, boundary ${at} FAILED: ${e.message}`);
+    hooks.onPhase('round:blocked', q.get.get(id));
   }
 }
 
 // ── boundary actions ─────────────────────────────────────────────────────
 function drawHotMarket(id) {
   const r = q.get.get(id);
+  /* If the draw already committed but the process died before the boundary
+     was marked, the persisted result is valid and verifiable. Treat it as
+     done rather than blocking for a seed we no longer hold in memory. */
+  if (r.draw_seed && r.hot_base && verifyDraw(r).ok) {
+    hooks.log(`round ${id} draw already persisted and verifies (${r.hot_base})`);
+    return;
+  }
   const seed = _seeds.get(id);
   if (!seed) {
     /* The seed lives in memory only, so a restart between arming and the
@@ -482,19 +595,30 @@ function openHot(id) {
   hooks.onPhase('hot:open', q.get.get(id));
 }
 
-function closeHot(id) {
+function closeHot(id, dueAt = null) {
   const r = q.get.get(id);
   const active = r.active_hot_base || r.hot_base;
   /* Not wrapped in try/catch on purpose: if the segment cannot be settled
      from one canonical mark, the boundary must fail and the round block
      rather than record a success that left someone holding scored exposure. */
-  if (active) hooks.closeAlias(active + '-HOT', { roundId: id });
+  /* Settle at the SCHEDULED mark. A late callback used to settle every Hot
+     position at the current price, so the segment kept accruing score after
+     its own window had closed. */
+  if (active) hooks.closeAlias(active + '-HOT', { roundId: id, settleAt: dueAt });
   hooks.onPhase('hot:close', r);
 }
 
 /* Boost opens a twin on every major at once: the window is shared, so there
  * is no per-player activation to track and nothing to consume. */
-let BOOST_MARKETS = ['BTC', 'ETH', 'BNB', 'XRP', 'SOL'];
+/* BNB is deliberately absent. Measured on the live feed 2026-08-30: its index
+   has ONE component (binance-usdt). Coinbase does not list it and it is
+   outside the binance-USDC deep set, so it is structurally single-source and
+   cannot meet the two-component rule Boost requires. A single wrong 8-20bps
+   tick sits well inside the 50bps jump clamp and is more than the ~5bps
+   liquidation distance at 1000x, so a lone source could liquidate a boosted
+   position on noise nobody could audit. Re-add it only if a second source
+   appears. */
+let BOOST_MARKETS = ['BTC', 'ETH', 'XRP', 'SOL'];
 const setBoostMarkets = (list) => { BOOST_MARKETS = list.slice(); };
 function openBoost(id) {
   const opened = [];
@@ -502,6 +626,14 @@ function openBoost(id) {
     try { hooks.openAlias(base + '-BOOST', id); opened.push(base); }
     catch (e) { hooks.log(`round ${id} boost skip ${base}: ${e.message}`); }
   }
+  if (!opened.length) {
+    // a Boost phase with no tradable market is not a degraded show, it is a
+    // missing one: fail the boundary so the round blocks rather than
+    // pretending the segment happened
+    throw new Error('no Boost market could be opened');
+  }
+  // persist what ACTUALLY opened, so a restart rehydrates the real set
+  q.setBoostOpened.run(JSON.stringify(opened), Date.now(), id);
   hooks.log(`round ${id} BOOST OPEN: ${opened.join(', ')}`);
   hooks.onPhase('boost:open', q.get.get(id));
 }
@@ -580,11 +712,23 @@ function bell(id, dueAt = null) {
 function snapshot(roundId, checkpoint, scheduledAt = null) {
   const r = q.get.get(roundId);
   if (!r) throw new Error('no such round: ' + roundId);
+  /* A complete checkpoint is immutable and is returned as-is. Recomputing
+     current state first meant a replay could throw on today's data even
+     though the stored result was already final. */
+  const already = q.scores.all(roundId, checkpoint);
+  if (already.length && already.length === q.players.all(roundId).length) {
+    hooks.log(`round ${roundId} ${checkpoint} already complete, returning stored rows`);
+    return already;
+  }
   const at = Date.now();
   const asOf = Number.isFinite(scheduledAt) ? scheduledAt : at;
   const hotTicker = (r.active_hot_base || r.hot_base) ? (r.active_hot_base || r.hot_base) + '-HOT' : null;
   const players = q.players.all(roundId);
-  const marks = hooks.markSetFor(players.map((p) => p.user_id), asOf);
+  /* strict: a checkpoint must be priced from marks that existed at the
+     boundary. If any are missing the snapshot throws, the boundary is
+     recorded failed and the round blocks, rather than publishing a number
+     nobody can reproduce. */
+  const marks = hooks.markSetFor(players.map((p) => p.user_id), asOf, { strict: true });
   const marksJson = JSON.stringify(marks);
   if (at - asOf > 1000) {
     hooks.log(`round ${roundId} ${checkpoint}: boundary ran ${at - asOf}ms late, priced as of the scheduled time`);
@@ -595,7 +739,7 @@ function snapshot(roundId, checkpoint, scheduledAt = null) {
      whoever the engine happened to trip over. If any seat cannot be scored
      the whole checkpoint throws and the boundary is recorded as failed. */
   const rows = players.map((p) => {
-    const s = hooks.scoreUser(p.user_id, hotTicker, p.epoch, p.start_balance, marks);
+    const s = hooks.scoreUser(p.user_id, hotTicker, p.epoch, p.start_balance, marks, asOf);
     const row = { ...p, ...s, score: s.accountPnl + s.hotBonus, at };
     /* Validate EVERY stored scalar, not just the two the score is built from.
        A null equity used to pass this check and then be dropped by the NOT
@@ -606,6 +750,7 @@ function snapshot(roundId, checkpoint, scheduledAt = null) {
         throw new Error(`unscoreable seat ${p.user_id} (${p.display_name || 'unnamed'}): ${f}`);
       }
     }
+    row.maxDrawdown = Number(p.max_drawdown) || 0;
     return row;
   });
 
@@ -623,7 +768,7 @@ function snapshot(roundId, checkpoint, scheduledAt = null) {
   }
   db.transaction(() => {
     for (const x of rows) {
-      q.scoreInsStrict.run(roundId, x.user_id, checkpoint, at, x.equity, x.accountPnl, x.realized, x.hotBonus, x.score, marksJson, asOf);
+      q.scoreInsStrict.run(roundId, x.user_id, checkpoint, at, x.equity, x.accountPnl, x.realized, x.hotBonus, x.score, marksJson, asOf, x.maxDrawdown);
     }
     const n = q.scores.all(roundId, checkpoint).length;
     if (n !== rows.length) throw new Error(`checkpoint wrote ${n}/${rows.length} rows`);
@@ -639,9 +784,10 @@ function snapshot(roundId, checkpoint, scheduledAt = null) {
  * engine does not track per round. Until it does, realised PnL is the first
  * live tie-break and this is a known gap, not an oversight. */
 function standings(roundId, checkpoint) {
-  const dd = new Map(q.players.all(roundId).map((p) => [p.user_id, Number(p.max_drawdown) || 0]));
   return q.scores.all(roundId, checkpoint)
-    .map((r) => ({ ...r, maxDrawdown: dd.get(r.user_id) ?? 0 }))
+    /* The FROZEN drawdown, not the roster's current one: a published order
+       must not change because someone dipped after the checkpoint. */
+    .map((r) => ({ ...r, maxDrawdown: Number(r.max_drawdown) || 0 }))
     /* Published order: score, then LOWEST maximum drawdown, then higher
        realised PnL, then seat. Deterministic, so nobody has to make a call on
        stage. */
@@ -691,6 +837,45 @@ function sampleDrawdown(now = Date.now()) {
     if (peak !== p.peak_equity || dd !== p.max_drawdown) {
       q.ddUpd.run(peak, dd, r.id, p.user_id);
     }
+  }
+}
+
+/* ── the round clock ──────────────────────────────────────────────────────
+ *
+ * The correctness argument for the whole competition rests here.
+ *
+ * Timers alone could only guarantee that a boundary fires EVENTUALLY. A
+ * checkpoint taken by a late callback then priced the past but read the
+ * present: a fill, stop, or liquidation landing after the boundary entered a
+ * result that claimed to be from before it.
+ *
+ * Every mutation now advances this clock first. If a boundary is due, it
+ * settles BEFORE the mutation is applied. That makes "current state at the
+ * moment the boundary fires" identical to "state as of the boundary", which
+ * is what lets snapshot() read live rows and still be correct. Timers remain
+ * as the liveness mechanism for a quiet market; they are no longer the
+ * authority.
+ */
+let _advancing = false;
+function advanceRoundClock(eventTime = Date.now()) {
+  // Re-entrancy: firing a boundary settles positions, which applies fills,
+  // which would advance the clock again. The outermost call owns the pass.
+  if (_advancing) return;
+  const r = currentRound();
+  if (!r || !r.started_at || r.blocked_reason) return;
+  const elapsed = eventTime - r.started_at;
+  const due = boundariesOf(r.kind).filter((at) => at <= elapsed);
+  if (!due.length) return;
+  _advancing = true;
+  try {
+    for (const at of due) {          // ascending: boundariesOf is ordered
+      const b = q.bGet.get(r.id, at);
+      if (b && b.status === 'succeeded') continue;
+      fireBoundary(r.id, at);
+      if (q.get.get(r.id).blocked_reason) break;   // stop at the first block
+    }
+  } finally {
+    _advancing = false;
   }
 }
 
@@ -768,7 +953,12 @@ function resume() {
   /* Segment gates are in-memory, so a restart mid-Hot leaves the phase saying
      Hot while the ticker is shut. Rebuild them from durable state rather than
      relying on replaying a boundary that is already recorded as succeeded. */
-  rehydrateGates(r);
+  /* Gates cannot always be restored on the first attempt: straight after a
+     restart the composite index has not resumed, so opening a ticker fails on
+     "no fresh mark". Giving up there left the phase saying Hot while the
+     ticker stayed shut, which is exactly what the rehearsal caught. Retry
+     while the round is still in that phase, and block if it never comes back. */
+  rehydrateWithRetry(r.id);
 
   if (past) { fireBoundary(r.id, ROUND_PLAN[r.kind].total); return q.get.get(r.id); }
   hooks.log(`resuming round ${r.id}, ${Math.round((r.ends_at - Date.now()) / 1000)}s left`);
@@ -776,29 +966,54 @@ function resume() {
   return r;
 }
 
+const REHYDRATE_TIMEOUT_MS = Number(process.env.PAPER_REHYDRATE_TIMEOUT_MS || 60_000);
+/** Keep trying to restore this round's gates until they match the phase, the
+ *  phase moves on, or we give up and block. Prices lag a restart by seconds;
+ *  a segment must not be silently missing for the rest of its window. */
+function rehydrateWithRetry(id, startedAt = Date.now()) {
+  const r = q.get.get(id);
+  if (!r || r.status !== 'running' || r.blocked_reason) return;
+  const missing = rehydrateGates(r);
+  if (!missing.length) return;
+  if (Date.now() - startedAt > REHYDRATE_TIMEOUT_MS) {
+    const why = `could not restore segment ticker(s) ${missing.join(', ')} after a restart`;
+    q.setBlocked.run(why, Date.now(), id);
+    hooks.log(`round ${id} BLOCKED: ${why}`);
+    hooks.onPhase('round:blocked', q.get.get(id));
+    return;
+  }
+  const t = setTimeout(() => rehydrateWithRetry(id, startedAt), 1000);
+  t.unref?.();
+}
+
 /** Reopen exactly the tickers the current phase says should be open, and
- *  close anything else this round owns. Called on boot. */
+ *  close anything else this round owns. Returns the tickers it could NOT
+ *  open, so the caller can retry or block rather than assume success. */
 function rehydrateGates(r) {
   const ph = phaseAt(r.kind, Date.now() - r.started_at).phase;
   const hot = r.active_hot_base || r.hot_base;
   const want = new Set();
   if (ph === 'hot' && hot) want.add(hot + '-HOT');
   if (ph === 'boost') for (const b of boostMarketsOf(r)) want.add(b + '-BOOST');
+  const missing = [];
   for (const a of want) {
-    try { hooks.openAlias(a, r.id); } catch (e) { hooks.log(`rehydrate ${a} failed: ${e.message}`); }
+    try { hooks.openAlias(a, r.id); }
+    catch (e) { missing.push(a); hooks.log(`rehydrate ${a} not yet: ${e.message}`); }
   }
   const all = [hot && hot + '-HOT', r.hot_base && r.hot_base + '-HOT',
     ...boostMarketsOf(r).map((b) => b + '-BOOST')].filter(Boolean);
   for (const a of all) {
     if (!want.has(a)) { try { hooks.closeAlias(a, { flatten: false, roundId: r.id }); } catch {} }
   }
-  hooks.log(`round ${r.id} gates rehydrated for phase ${ph}: ${[...want].join(', ') || 'none'}`);
+  hooks.log(`round ${r.id} gates for phase ${ph}: ${[...want].filter((a) => !missing.includes(a)).join(', ') || 'none'}` +
+    (missing.length ? ` (pending: ${missing.join(', ')})` : ''));
+  return missing;
 }
 
 module.exports = {
   ROUND_PLAN, COMP_BASE_LEV, wire, phaseAt, boundariesOf, inRound,
-  createRound, startRound, abortRound, currentRound, playersOf, accountLocked, clearBlock, sampleDrawdown,
-  phaseNow, levCapFor, resume, rehydrateGates, verifyDraw, setBoostMarkets, settledFor, writeBarrier,
+  createRound, startRound, abortRound, currentRound, playersOf, accountLocked, clearBlock, sampleDrawdown, otherRoundsOwning,
+  phaseNow, levCapFor, resume, rehydrateGates, verifyDraw, advanceRoundClock, setBoostMarkets, settledFor, writeBarrier,
   snapshot, standings, firstFiveResult,
   __test: { db, q, commitOf, drawIndex, _seeds, _timers, fireBoundary, schedule },
 };

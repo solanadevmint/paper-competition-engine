@@ -11,6 +11,10 @@ const assert = require('assert');
 
 process.env.PHOENIX_SNAPSHOT_FILE = '/nonexistent/markets-snapshot.json';
 process.env.PAPER_COMP_TOKEN = process.env.PAPER_COMP_TOKEN || 'test-token';
+/* The wall feed is cached for ~200ms in production so an audience polling it
+   cannot tax the show's event loop. A test moves faster than that, so it
+   would otherwise assert against a stale body. */
+process.env.PAPER_COMP_STATE_TTL_MS = '0';
 if (!process.env.PAPER_DB || process.env.PAPER_DB.startsWith('/opt/')) {
   console.error('refusing to run: set PAPER_DB to a throwaway path first');
   process.exit(2);
@@ -24,10 +28,30 @@ const { ROUND_PLAN } = comp;
 const TOKEN = process.env.PAPER_COMP_TOKEN;
 
 let pass = 0;
-const ok = (name, fn) => {
-  try { fn(); console.log('  ok   ' + name); pass++; }
+/* Awaits the body. A synchronous helper silently dropped promise-returning
+   tests: the suite printed passes and then died on an unhandled rejection
+   with a non-zero exit, so counting "ok" lines reported green on a failing
+   suite. Every caller is awaited now. */
+/* Names the in-flight test if the suite stalls. A hung suite otherwise just
+   stops printing, and the last successful line is a misleading place to look. */
+let _inflight = null;
+const _watchdog = setInterval(() => {
+  if (_inflight && Date.now() - _inflight.at > 15_000) {
+    console.log(`  STALL  ${_inflight.name} (no return after 15s)`);
+    process.exit(3);
+  }
+}, 1000);
+_watchdog.unref?.();
+const ok = async (name, fn) => {
+  _inflight = { name, at: Date.now() };
+  try { await fn(); console.log('  ok   ' + name); pass++; }
   catch (e) { console.log('  FAIL ' + name + '\n       ' + e.message); process.exitCode = 1; }
+  finally { _inflight = null; }
 };
+process.on('unhandledRejection', (e) => {
+  console.log('  FAIL unhandled rejection\n       ' + (e && e.message ? e.message : e));
+  process.exitCode = 1;
+});
 
 // ── fake req/res ─────────────────────────────────────────────────────────
 function mkRes() {
@@ -73,6 +97,11 @@ const verify = (id) => {
 const now = Date.now();
 for (const s of ['BTC', 'SOL', 'ETH', 'BNB', 'XRP']) {
   T.live.map.set(s, { markPrice: 100, pythPrice: 100, pythAtMs: now, pythBasis: 0, lastUpdatedMs: now, indexHalt: false });
+  // a healthy index: two fresh components plus recorded history, which is
+  // what stage pricing and strict checkpoints now require
+  T.compUpdate(s, 'usdt', 100, now); T.compUpdate(s, 'usd', 100, now);
+  // a short trail so any boundary instant has a mark at or before it
+  for (let back = 20_000; back >= 0; back -= 2_000) T.recordMark(s, 100, now - back);
 }
 comp.wire({
   openAlias: T.openAlias, closeAlias: T.closeAlias, scoreUser: T.scoreUser,
@@ -90,78 +119,77 @@ for (const uid of SEATS) {
 
 (async () => {
   console.log('\nauth');
-  ok('no token is refused', async () => {});
+  await ok('no token is refused', async () => {});
   let r = await admin({ action: 'create', id: 'x', candidates: ['BTC', 'SOL'] });
-  ok('a request with no token is forbidden', () => {
+  await ok('a request with no token is forbidden', () => {
     assert.strictEqual(r.code, 403);
     assert.strictEqual(r.body.error, 'forbidden');
   });
   r = await admin({ action: 'create', id: 'x', candidates: ['BTC', 'SOL'], token: 'wrong' });
-  ok('a wrong token is forbidden', () => assert.strictEqual(r.code, 403));
+  await ok('a wrong token is forbidden', () => assert.strictEqual(r.code, 403));
   r = await adminBodyTokenOnly({ action: 'create', id: 'x', candidates: ['BTC', 'SOL'], token: TOKEN });
-  ok('a token in the request BODY is refused', () => {
+  await ok('a token in the request BODY is refused', () => {
     assert.strictEqual(r.code, 403, 'body tokens leak into logs; header only');
   });
   r = await admin({ action: 'create', id: 'e2e', candidates: ['BTC', 'SOL', 'ETH'], backup: 'XRP', token: TOKEN,
                     players: SEATS.map((u, i) => ({ userId: u, displayName: 'P' + i, seat: i })) });
-  ok('the operator token is accepted', () => {
+  await ok('the operator token is accepted', () => {
     assert.strictEqual(r.code, 200);
     assert.strictEqual(r.body.round.id, 'e2e');
     assert.strictEqual(r.body.round.status, 'armed');
   });
-  ok('the header form of the token works too', async () => {});
+  await ok('the header form of the token works too', async () => {});
   r = await admin({ action: 'standings', id: 'e2e' }, { 'x-comp-token': TOKEN });
-  ok('x-comp-token is accepted', () => assert.strictEqual(r.code, 200));
+  await ok('x-comp-token is accepted', () => assert.strictEqual(r.code, 200));
 
   console.log('\npre-flight');
   r = await admin({ action: 'preflight', id: 'e2e', token: TOKEN });
-  ok('reports every seat ready before a round', () => {
+  await ok('reports every seat ready before a round', () => {
     assert.strictEqual(r.body.allReady, true, JSON.stringify(r.body.players));
     assert.strictEqual(r.body.players.length, 2);
   });
-  ok('flags a seat that is carrying a position', () => {
+  await ok('flags a seat that is carrying a position', async () => {
     T.stmt.posIns.run(SEATS[0], 'BTC', 1, 'LONG', 1, 100, 10, Date.now(), 100, Date.now(), Date.now(), 'cross', 0);
-    const res = mkRes();
-    return P.compAdmin(mkReq({ action: 'preflight', id: 'e2e', token: TOKEN }), res).then(() => {
-      assert.strictEqual(res.body.allReady, false, 'a leftover position must block the start');
-    });
+    // header, not body: the token is header-only now
+    const r2 = await admin({ action: 'preflight', id: 'e2e', token: TOKEN });
+    assert.strictEqual(r2.body.allReady, false, 'a leftover position must block the start');
   });
   r = await admin({ action: 'preflight', id: 'e2e', token: TOKEN });
-  ok('a stale seat is actually reported not ready', () => assert.strictEqual(r.body.allReady, false));
+  await ok('a stale seat is actually reported not ready', () => assert.strictEqual(r.body.allReady, false));
 
   console.log('\nreset');
   r = await admin({ action: 'resetPlayers', id: 'e2e', token: TOKEN });
-  ok('resetting clears positions and bumps the epoch for everyone', () => {
+  await ok('resetting clears positions and bumps the epoch for everyone', () => {
     assert.strictEqual(r.body.reset.length, 2);
     assert.strictEqual(T.stmt.posByUser.all(SEATS[0]).length, 0, 'positions must be gone');
   });
   r = await admin({ action: 'preflight', id: 'e2e', token: TOKEN });
-  ok('pre-flight goes green after a reset', () => assert.strictEqual(r.body.allReady, true));
+  await ok('pre-flight goes green after a reset', () => assert.strictEqual(r.body.allReady, true));
 
   console.log('\nlive state');
-  ok('nothing is live before the round starts', () => assert.strictEqual(state().live, false));
+  await ok('nothing is live before the round starts', () => assert.strictEqual(state().live, false));
   await admin({ action: 'start', id: 'e2e', token: TOKEN });
   let st = state();
-  ok('the wall sees the round, the phase and the clock', () => {
+  await ok('the wall sees the round, the phase and the clock', () => {
     assert.strictEqual(st.live, true);
     assert.strictEqual(st.phase, 'firstFive');
     assert.ok(st.leftMs > 29 * 60_000, 'about 30 minutes left');
     assert.strictEqual(st.players.length, 2);
     assert.strictEqual(st.players[0].rank, 1);
   });
-  ok('the drawn market is withheld until the reveal', () => {
+  await ok('the drawn market is withheld until the reveal', () => {
     assert.strictEqual(st.hot, null, 'a spectator must not learn it early');
     assert.deepStrictEqual(st.candidates, ['BTC', 'SOL', 'ETH'], 'but the shortlist is public');
     assert.ok(st.drawCommit, 'and the commitment is published up front');
   });
-  ok('boost is not open in the opening phase', () => assert.strictEqual(st.boostOpen, false));
-  ok('the wall is told what each trader is holding', () => {
+  await ok('boost is not open in the opening phase', () => assert.strictEqual(st.boostOpen, false));
+  await ok('the wall is told what each trader is holding', () => {
     // the show has to answer "what is she trading" without narration
     for (const p of st.players ?? []) {
       assert.ok(Array.isArray(p.positions), 'positions must always be an array');
     }
   });
-  ok('a held position surfaces on the wall with its side and size', async () => {
+  await ok('a held position surfaces on the wall with its side and size', async () => {
     T.stmt.posIns.run(SEATS[0], 'BTC', T.stmt.acctGet.get(SEATS[0]).epoch,
       'SHORT', 1, 100, 25, Date.now(), 100, Date.now(), Date.now(), 'cross', 0);
     const row = state().players.find((p) => p.userId === SEATS[0]);
@@ -178,12 +206,12 @@ for (const uid of SEATS) {
   warpTo('e2e', ROUND_PLAN.round.reveal + 1000);
   CT.fireBoundary('e2e', ROUND_PLAN.round.reveal);
   st = state();
-  ok('after the reveal the market is public but not yet tradable', () => {
+  await ok('after the reveal the market is public but not yet tradable', () => {
     assert.ok(st.hot && st.hot.market, 'market should be revealed');
     assert.strictEqual(st.hot.open, false, 'the window opens 15s later');
     assert.strictEqual(st.phase, 'reveal');
   });
-  ok('anyone can verify the draw without a token', () => {
+  await ok('anyone can verify the draw without a token', () => {
     const v = verify('e2e');
     assert.strictEqual(v.verified.ok, true, v.verified.reason);
     assert.strictEqual(v.drawn, st.hot.market);
@@ -191,22 +219,22 @@ for (const uid of SEATS) {
   });
   warpTo('e2e', ROUND_PLAN.round.hotStart + 1000);
   CT.fireBoundary('e2e', ROUND_PLAN.round.hotStart);
-  ok('the hot ticker opens on its boundary', () => {
+  await ok('the hot ticker opens on its boundary', () => {
     assert.strictEqual(state().hot.open, true);
     assert.strictEqual(state().phase, 'hot');
   });
   warpTo('e2e', ROUND_PLAN.round.hotEnd + 1000);
   CT.fireBoundary('e2e', ROUND_PLAN.round.hotEnd);
-  ok('and closes again', () => assert.strictEqual(state().hot.open, false));
+  await ok('and closes again', () => assert.strictEqual(state().hot.open, false));
   warpTo('e2e', ROUND_PLAN.round.boostStart + 1000);
   CT.fireBoundary('e2e', ROUND_PLAN.round.boostStart);
-  ok('boost shows as open on the wall', () => {
+  await ok('boost shows as open on the wall', () => {
     const s = state();
     assert.strictEqual(s.phase, 'boost');
     assert.strictEqual(s.boostOpen, true);
     assert.ok(s.boostMarkets.includes('BTC'), 'and names the markets: ' + JSON.stringify(s.boostMarkets));
   });
-  ok('the wall reports the GATE, not merely the clock', () => {
+  await ok('the wall reports the GATE, not merely the clock', () => {
     // close the twins behind the wall's back: the schedule still says Boost,
     // but the engine would now refuse the order, and the wall must agree
     for (const b of ['BTC', 'ETH', 'BNB', 'XRP', 'SOL']) T.closeAlias(b + '-BOOST');
@@ -218,18 +246,18 @@ for (const uid of SEATS) {
   console.log('\nbell');
   warpTo('e2e', ROUND_PLAN.round.total + 1000);
   CT.fireBoundary('e2e', ROUND_PLAN.round.total);
-  ok('the round leaves live state when it ends', () => assert.strictEqual(state().live, false));
+  await ok('the round leaves live state when it ends', () => assert.strictEqual(state().live, false));
   r = await admin({ action: 'standings', id: 'e2e', checkpoint: 'final', token: TOKEN });
-  ok('final standings are readable and ranked', () => {
+  await ok('final standings are readable and ranked', () => {
     assert.strictEqual(r.body.board.length, 2);
     assert.strictEqual(r.body.board[0].rank, 1);
   });
   r = await admin({ action: 'firstFive', id: 'e2e', token: TOKEN });
-  ok('the First Five result is available after the round', () => {
+  await ok('the First Five result is available after the round', () => {
     assert.ok('winner' in r.body && 'reason' in r.body);
   });
   r = await admin({ action: 'nonsense', id: 'e2e', token: TOKEN });
-  ok('an unknown action is rejected, not ignored', () => assert.strictEqual(r.code, 400));
+  await ok('an unknown action is rejected, not ignored', () => assert.strictEqual(r.code, 400));
 
   console.log(`\n${pass} passed${process.exitCode ? ', WITH FAILURES' : ''}\n`);
 })();

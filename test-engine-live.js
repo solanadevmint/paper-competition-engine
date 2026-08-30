@@ -39,9 +39,21 @@ const CT = comp.__test;
 const { ROUND_PLAN } = comp;
 
 let pass = 0;
+/* Names the in-flight test if the suite stalls. A hung suite otherwise just
+   stops printing, and the last successful line is a misleading place to look. */
+let _inflight = null;
+const _watchdog = setInterval(() => {
+  if (_inflight && Date.now() - _inflight.at > 15_000) {
+    console.log(`  STALL  ${_inflight.name} (no return after 15s)`);
+    process.exit(3);
+  }
+}, 1000);
+_watchdog.unref?.();
 const ok = async (name, fn) => {
+  _inflight = { name, at: Date.now() };
   try { await fn(); console.log('  ok   ' + name); pass++; }
   catch (e) { console.log('  FAIL ' + name + '\n       ' + e.message); process.exitCode = 1; }
+  finally { _inflight = null; }
 };
 const near = (a, b, eps) => Math.abs(a - b) <= eps;
 
@@ -224,5 +236,4 @@ const balOf = (uid) => T.stmt.acctGet.get(uid).balance;
   });
 
   console.log(`\n${pass} passed${process.exitCode ? ', WITH FAILURES' : ''}\n`);
-  process.exit(process.exitCode || 0);
 })();

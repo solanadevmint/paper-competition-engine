@@ -19,18 +19,54 @@ const CT = comp.__test;
 const { ROUND_PLAN } = comp;
 
 let pass = 0;
-const ok = (name, fn) => {
-  try { fn(); console.log('  ok   ' + name); pass++; }
+/* Awaits the body. A synchronous helper silently dropped promise-returning
+   tests: the suite printed passes and then died on an unhandled rejection
+   with a non-zero exit, so counting "ok" lines reported green on a failing
+   suite. Every caller is awaited now. */
+/* Names the in-flight test if the suite stalls. A hung suite otherwise just
+   stops printing, and the last successful line is a misleading place to look. */
+let _inflight = null;
+const _watchdog = setInterval(() => {
+  if (_inflight && Date.now() - _inflight.at > 15_000) {
+    console.log(`  STALL  ${_inflight.name} (no return after 15s)`);
+    process.exit(3);
+  }
+}, 1000);
+_watchdog.unref?.();
+const ok = async (name, fn) => {
+  _inflight = { name, at: Date.now() };
+  try { await fn(); console.log('  ok   ' + name); pass++; }
   catch (e) { console.log('  FAIL ' + name + '\n       ' + e.message); process.exitCode = 1; }
+  finally { _inflight = null; }
 };
+process.on('unhandledRejection', (e) => {
+  console.log('  FAIL unhandled rejection\n       ' + (e && e.message ? e.message : e));
+  process.exitCode = 1;
+});
 const near = (a, b, eps = 1e-6) => Math.abs(a - b) < eps;
 
 const now = Date.now();
-const setMark = (sym, px) => T.live.map.set(sym, {
+const setMarkRaw = (sym, px) => T.live.map.set(sym, {
   markPrice: px, pythPrice: px, pythAtMs: Date.now(), pythBasis: 0,
   lastUpdatedMs: Date.now(), indexHalt: false,
 });
-for (const s of ['BTC', 'SOL', 'ETH', 'BNB', 'XRP']) setMark(s, 100);
+
+/* Fixtures must look like a HEALTHY index, not just a populated map. Stage
+   pricing now requires a fresh composite from at least two agreeing
+   components while a round is live, and checkpoints price strictly from
+   recorded history, so a fixture that only wrote live.map was pretending to
+   be a market it was not. */
+function feedMark(sym, px, t = Date.now()) {
+  T.compUpdate(sym, 'usdt', px, t);
+  T.compUpdate(sym, 'usd', px, t);
+  /* A real index ticks continuously, so any boundary instant has a mark at or
+     before it. A fixture that records ONE sample at "now" has no history
+     behind it, and a suite fast enough to fire a boundary within the same
+     second finds nothing to price from. Seed a short trail. */
+  for (let back = 20_000; back > 0; back -= 2_000) T.recordMark(sym, px, t - back);
+  T.recordMark(sym, px, t);
+}
+for (const s of ['BTC', 'SOL', 'ETH', 'BNB', 'XRP']) { setMarkRaw(s, 100); feedMark(s, 100); }
 T.mktCfg.set('BTC', { tiers: [], maxLev: 40, lotSize: null, takerBps: 3.5, makerBps: 0.5, maintBps: 50, cancelBps: 0, maxLiqSize: null, status: 'active', isolatedOnly: false });
 T.mktCfg.set('SOL', { ...T.mktCfg.get('BTC') });
 
@@ -78,11 +114,11 @@ ok('realised profit shows up in account PnL', () => {
 ok('an open position marks to the index', () => {
   // 1 unit long BTC entered at 100, mark moves to 103
   T.stmt.posIns.run(ALEX, 'BTC', epochOf(ALEX), 'LONG', 1, 100, 10, Date.now(), 100, Date.now(), Date.now(), 'cross', 0);
-  setMark('BTC', 103);
+  setMarkRaw('BTC', 103); feedMark('BTC', 103);
   const s = T.scoreUser(ALEX, null);
   assert.ok(near(s.accountPnl, 3), 'unrealised should count: expected 3, got ' + s.accountPnl);
   assert.ok(near(s.realized, 0), 'and it is not realised');
-  setMark('BTC', 100);
+  setMarkRaw('BTC', 100); feedMark('BTC', 100);
 });
 
 console.log('\nHot Market bonus');
@@ -127,10 +163,10 @@ ok('a snapshot writes one row per player and ranks them', () => {
 });
 ok('a frozen checkpoint does not move when the market does', () => {
   const before = comp.standings('r-score', 'firstFive')[0].score;
-  setMark('BTC', 140);            // Alex is long BTC; a published result must not change
+  setMarkRaw('BTC', 140); feedMark('BTC', 140);            // Alex is long BTC; a published result must not change
   const after = comp.standings('r-score', 'firstFive')[0].score;
   assert.ok(near(before, after), `checkpoint moved: ${before} -> ${after}`);
-  setMark('BTC', 100);
+  setMarkRaw('BTC', 100); feedMark('BTC', 100);
 });
 ok('re-running a checkpoint cannot overwrite it', () => {
   const before = comp.standings('r-score', 'firstFive').map((r) => r.score);
@@ -186,6 +222,11 @@ ok('the bell freezes a final checkpoint without closing positions', () => {
     players: [{ userId: MIA, displayName: 'Mia' }, { userId: ALEX, displayName: 'Alex' }],
   });
   start('r-bell');
+  /* Wind the clock to the bell. Firing it 30 minutes early puts the boundary
+     instant far ahead of any recorded mark, and strict pricing rightly
+     refuses to settle from a price that did not exist yet. */
+  CT.db.prepare('UPDATE paper_rounds SET started_at = ? WHERE id = ?')
+    .run(Date.now() - (ROUND_PLAN.round.total + 500), 'r-bell');
   const openBefore = T.stmt.posByUser.all(ALEX).length;
   CT.fireBoundary('r-bell', ROUND_PLAN.round.total);
   assert.strictEqual(CT.q.get.get('r-bell').status, 'done');

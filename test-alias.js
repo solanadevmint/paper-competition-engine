@@ -24,10 +24,30 @@ const T = P.__test;
 const { baseOf, aliasKind, aliasOpen, openAlias, closeAlias, cfgOf, stageLevCap, mkt, stmt, live, mktCfg } = T;
 
 let pass = 0;
-const ok = (name, fn) => {
-  try { fn(); console.log('  ok   ' + name); pass++; }
+/* Awaits the body. A synchronous helper silently dropped promise-returning
+   tests: the suite printed passes and then died on an unhandled rejection
+   with a non-zero exit, so counting "ok" lines reported green on a failing
+   suite. Every caller is awaited now. */
+/* Names the in-flight test if the suite stalls. A hung suite otherwise just
+   stops printing, and the last successful line is a misleading place to look. */
+let _inflight = null;
+const _watchdog = setInterval(() => {
+  if (_inflight && Date.now() - _inflight.at > 15_000) {
+    console.log(`  STALL  ${_inflight.name} (no return after 15s)`);
+    process.exit(3);
+  }
+}, 1000);
+_watchdog.unref?.();
+const ok = async (name, fn) => {
+  _inflight = { name, at: Date.now() };
+  try { await fn(); console.log('  ok   ' + name); pass++; }
   catch (e) { console.log('  FAIL ' + name + '\n       ' + e.message); process.exitCode = 1; }
+  finally { _inflight = null; }
 };
+process.on('unhandledRejection', (e) => {
+  console.log('  FAIL unhandled rejection\n       ' + (e && e.message ? e.message : e));
+  process.exitCode = 1;
+});
 
 // ── a synthetic BTC market, fresh enough to price against ────────────────
 const now = Date.now();
