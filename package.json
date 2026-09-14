@@ -1,11 +1,23 @@
 {
-  "name": "phoenix-paper",
-  "version": "1.0.0",
-  "private": true,
-  "description": "Isolated paper trading engine for perp.so (/paper, /ftpaper)",
+  "name": "paper-competition-engine",
+  "version": "2026.9.13",
+  "description": "Perps paper-trading engine with a live competition layer (two Hot Markets, 500x Boost, verifiable draw, per-seat proofs).",
   "main": "server.js",
+  "scripts": {
+    "check": "node --check paper.js && node --check competition.js && node --check server.js && node --check auth-shim.js && node --check bots.js",
+    "test": "node test-all.js",
+    "test:live": "node test-engine-live.js"
+  },
   "dependencies": {
     "better-sqlite3": "^11.3.0",
     "ws": "^8.18.0"
+  },
+  "license": "MIT",
+  "engines": {
+    "node": ">=20"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/solanadevmint/paper-competition-engine"
   }
 }

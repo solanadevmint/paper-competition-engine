@@ -1,6 +1,5 @@
-/* Sandbox test for competition scoring: the 2x Hot bonus, the separation of
- * competition score from account equity, the frozen checkpoints, and the
- * First Five prize rule.
+/* Sandbox test for base account scoring and immutable final checkpoints.
+ * Current two-Hot economic-delta scoring is exercised in test-two-hot.js.
  *
  *   PAPER_DB=$(mktemp -u --suffix=.db) node test-scoring.js
  */
@@ -12,6 +11,10 @@ if (!process.env.PAPER_DB || process.env.PAPER_DB.startsWith('/opt/')) {
   process.exit(2);
 }
 
+/* These suites drive the clock by hand and never accumulate reliability
+   history, which production now requires. Say so explicitly rather than
+   letting the engine silently treat no-evidence as evidence. */
+process.env.PAPER_ALLOW_UNPROVEN_MARKETS = '1';
 const comp = require('./competition.js');
 const P = require('./paper.js');
 const T = P.__test;
@@ -87,7 +90,9 @@ T.mktCfg.set('SOL', { ...T.mktCfg.get('BTC') });
 
 const logs = [];
 comp.wire({
+  marketReady: () => true, // Explicit fixture price policy.
   openAlias: T.openAlias, closeAlias: T.closeAlias, scoreUser: T.scoreUser,
+  scoreProofFor: T.scoreProofFor,
   prepareSeat: T.prepareSeat, seatState: T.seatState, markSetFor: T.markSetFor,
   equityOf: (uid) => { const a = T.stmt.acctGet.get(uid); return a ? T.accountRisk(uid, a).equityTotal : NaN; },
   log: (m) => logs.push(m),
@@ -137,104 +142,46 @@ function realisedFill(uid, symbol, pnl) {
     setMarkRaw('BTC', 100); feedMark('BTC', 100);
   });
 
-  console.log('\nHot Market bonus');
-  await ok('Hot PnL counts twice, once as account PnL and once as bonus', () => {
-    realisedFill(MIA, 'SOL-HOT', 2);
-    const s = T.scoreUser(MIA, 'SOL-HOT');
-    assert.ok(near(s.accountPnl, 6), 'account: 4 + 2 = 6, got ' + s.accountPnl);
-    assert.ok(near(s.hotBonus, 2), 'bonus mirrors the hot leg only');
-    assert.ok(near(s.accountPnl + s.hotBonus, 8), 'score doubles the hot leg');
-  });
-  await ok('a Hot loss counts twice too', () => {
-    realisedFill(ALEX, 'SOL-HOT', -3);
-    const s = T.scoreUser(ALEX, 'SOL-HOT');
-    assert.ok(near(s.hotBonus, -3), 'bonus must be symmetric, got ' + s.hotBonus);
-    assert.ok(near(s.accountPnl + s.hotBonus, s.accountPnl - 3));
-  });
-  await ok('trades outside the Hot ticker earn no bonus', () => {
-    const s = T.scoreUser(MIA, 'SOL-HOT');
-    const onlyBtc = T.scoreUser(MIA, 'BTC-HOT');
-    assert.ok(near(onlyBtc.hotBonus, 0), 'a different hot market must not pay');
-    assert.ok(near(s.hotBonus, 2));
-  });
-  await ok('the bonus never touches equity', () => {
-    const s = T.scoreUser(MIA, 'SOL-HOT');
-    const acct = T.stmt.acctGet.get(MIA);
-    assert.ok(near(s.equity, acct.balance), 'equity is balance + uPnL, bonus excluded');
-  });
-
   console.log('\nfrozen checkpoints');
   await ok('a snapshot writes one row per player and ranks them', () => {
     comp.createRound({
-      id: 'r-score', candidates: ['SOL', 'BTC'],
+      id: 'r-score', candidates: ['SOL', 'BTC', 'ETH'],
       players: [{ userId: MIA, displayName: 'Mia' }, { userId: ALEX, displayName: 'Alex' }],
     });
     start('r-score');
-    CT.q.setDraw.run('SOL', null, null, Date.now(), 'r-score');   // pretend SOL was drawn
-    comp.snapshot('r-score', 'firstFive');
-    const board = comp.standings('r-score', 'firstFive');
+    comp.snapshot('r-score', 'final');
+    const board = comp.standings('r-score', 'final');
     assert.strictEqual(board.length, 2);
     assert.strictEqual(board[0].rank, 1);
-    assert.strictEqual(board[0].display_name, 'Mia', 'Mia +8 should lead Alex');
+    assert.strictEqual(board[0].display_name, 'Mia', 'Mia should lead Alex');
   });
   await ok('a frozen checkpoint does not move when the market does', () => {
-    const before = comp.standings('r-score', 'firstFive')[0].score;
+    const before = comp.standings('r-score', 'final')[0].score;
     setMarkRaw('BTC', 140); feedMark('BTC', 140);            // Alex is long BTC; a published result must not change
-    const after = comp.standings('r-score', 'firstFive')[0].score;
+    const after = comp.standings('r-score', 'final')[0].score;
     assert.ok(near(before, after), `checkpoint moved: ${before} -> ${after}`);
     setMarkRaw('BTC', 100); feedMark('BTC', 100);
   });
   await ok('re-running a checkpoint cannot overwrite it', () => {
-    const before = comp.standings('r-score', 'firstFive').map((r) => r.score);
+    const before = comp.standings('r-score', 'final').map((r) => r.score);
     realisedFill(MIA, 'BTC', 50);   // big move after the checkpoint
-    comp.snapshot('r-score', 'firstFive');
-    const after = comp.standings('r-score', 'firstFive').map((r) => r.score);
+    comp.snapshot('r-score', 'final');
+    const after = comp.standings('r-score', 'final').map((r) => r.score);
     assert.deepStrictEqual(after, before, 'the first write must win');
   });
 
-  console.log('\nFirst Five prize');
-  await ok('a positive leader wins the heat prize', () => {
-    const res = comp.firstFiveResult('r-score');
-    assert.ok(res.winner, 'expected a winner');
-    assert.strictEqual(res.winner.display_name, 'Mia');
-  });
-  /* Only one round may be live at a time now, so each case ends its round
-     before the next begins. That constraint is itself asserted below. */
+  console.log('\nround ownership');
   await ok('a second round cannot start while one is running', () => {
-    comp.createRound({ id: 'r-clash', candidates: ['SOL', 'BTC'], players: [{ userId: MIA }] });
+    comp.createRound({ id: 'r-clash', candidates: ['SOL', 'BTC', 'ETH'], players: [{ userId: MIA }] });
     assert.throws(() => start('r-clash'), /already running/);
     comp.abortRound('r-clash', { force: true });
-  });
-  await ok('an all-negative heat rolls the prize over', () => {
     comp.abortRound('r-score', { force: true });
-    const A = 6001, B = 6002;
-    mkPlayer(A); mkPlayer(B);
-    realisedFill(A, 'BTC', -2); realisedFill(B, 'BTC', -5);
-    comp.createRound({ id: 'r-red', candidates: ['SOL', 'BTC'], players: [{ userId: A }, { userId: B }] });
-    start('r-red');
-    comp.snapshot('r-red', 'firstFive');
-    const res = comp.firstFiveResult('r-red');
-    assert.strictEqual(res.winner, null, 'nobody positive: nothing should be paid');
-    assert.match(res.reason, /rolls over/);
-    comp.abortRound('r-red', { force: true });
-  });
-  await ok('the final always pays, even when everyone is red', () => {
-    const A = 6101, B = 6102;
-    mkPlayer(A); mkPlayer(B);
-    realisedFill(A, 'BTC', -2); realisedFill(B, 'BTC', -5);
-    comp.createRound({ id: 'r-final', kind: 'final', candidates: ['SOL', 'BTC'], players: [{ userId: A }, { userId: B }] });
-    start('r-final');
-    comp.snapshot('r-final', 'firstFive');
-    const res = comp.firstFiveResult('r-final');
-    assert.ok(res.winner, 'the main stage must not have an unclaimed prize');
-    assert.strictEqual(res.winner.user_id, A, 'least-negative wins');
-    comp.abortRound('r-final', { force: true });
   });
 
   console.log('\nthe bell');
   await ok('the bell freezes a final checkpoint without closing positions', () => {
     comp.createRound({
-      id: 'r-bell', candidates: ['SOL', 'BTC'],
+      id: 'r-bell', candidates: ['SOL', 'BTC', 'ETH'],
       players: [{ userId: MIA, displayName: 'Mia' }, { userId: ALEX, displayName: 'Alex' }],
     });
     start('r-bell');
@@ -256,8 +203,8 @@ function realisedFill(uid, symbol, pnl) {
   /* A suite that prints its summary before its cases have run is not a
      suite. Assert the count so a future promise-returning case cannot be
      silently dropped again. */
-  if (pass + fails !== 15) {
-    console.log(`  FAIL only ${pass + fails}/15 cases ran`);
+  if (pass + fails !== 8) {
+    console.log(`  FAIL only ${pass + fails}/8 cases ran`);
     process.exitCode = 1;
   }
 })();

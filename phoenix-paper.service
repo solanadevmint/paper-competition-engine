@@ -2,17 +2,50 @@
 Description=Phoenix paper trading engine (isolated)
 After=network-online.target
 Wants=network-online.target
+StartLimitIntervalSec=120
+StartLimitBurst=5
 
 [Service]
 Type=simple
-User=ubuntu
-WorkingDirectory=/opt/phoenix-paper
+User=phoenix-paper
+Group=phoenix-paper
+WorkingDirectory=/opt/phoenix-paper/current
 EnvironmentFile=/etc/phoenix-paper.env
-ExecStart=/usr/bin/node /opt/phoenix-paper/server.js
+ExecStart=/usr/bin/node /opt/phoenix-paper/current/server.js
 Restart=always
 RestartSec=5
+TimeoutStopSec=15
+KillSignal=SIGTERM
+KillMode=mixed
 # The engine is small by design; a leak should recycle the service, not the box.
 MemoryMax=1200M
+UMask=0077
+
+# Code is immutable to the service. SQLite and the validated snapshot live in
+# StateDirectory, which systemd creates as /var/lib/phoenix-paper with the
+# dedicated service account as owner.
+StateDirectory=phoenix-paper
+StateDirectoryMode=0700
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+NoNewPrivileges=true
+ProtectControlGroups=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectKernelLogs=true
+ProtectClock=true
+ProtectHostname=true
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+RemoveIPC=true
+LockPersonality=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallArchitectures=native
 
 [Install]
 WantedBy=multi-user.target

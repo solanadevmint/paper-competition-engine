@@ -87,9 +87,14 @@ mktCfg.set('BTC', {
     assert.strictEqual(cfgOf('BTC-HOT').takerBps, 3.5);
     assert.strictEqual(cfgOf('BTC-HOT').status, 'active');
   });
-  await ok('an alias inherits the base leverage cap', () => {
-    assert.strictEqual(stageLevCap('BTC-BOOST'), stageLevCap('BTC'));
-    assert.strictEqual(stageLevCap('BTC-BOOST'), 1000);
+  await ok('the BOOST twin is the only ticker that may exceed the base cap', () => {
+    /* Owner rule, 2026-09-04: the terminal is 100x on everything and 500x
+       exists only through the Boost, on the markets the Boost opens. The twin
+       is where the Boost actually trades, so it is the one that carries the
+       higher ceiling; the base market does not. */
+    assert.strictEqual(stageLevCap('BTC'), 100, 'the base market is the plain terminal cap');
+    assert.strictEqual(stageLevCap('BTC-BOOST'), 500, 'the twin carries the Boost');
+    assert.strictEqual(stageLevCap('BTC-HOT'), 100, 'Hot is scored double, not leveraged higher');
   });
 
   console.log('\nboost isolation');
@@ -99,6 +104,43 @@ mktCfg.set('BTC', {
   await ok('HOT twins and the base are not forced isolated', () => {
     assert.strictEqual(cfgOf('BTC-HOT').isolatedOnly, false);
     assert.strictEqual(cfgOf('BTC').isolatedOnly, false);
+  });
+
+  console.log('\nsegment pricing inherits the base');
+  await ok('an alias carries its base price verdict, so a live segment cannot pause the round', () => {
+    const t = Date.now();
+    /* AGEABLE, because the top tier now requires it: a quote whose provider
+       time we cannot read may keep a market trading but may not carry 500x
+       (the unageable-source rule). The refusal is asserted below. */
+    T.compUpdate('BTC', 'usdt', 100, t, t - 50);
+    T.compUpdate('BTC', 'usd', 100, t);
+    /* Guard against a VACUOUS pass. compPriceReady needs a real source chain,
+       not just a live.map row, so with the bare fixture the base is false too
+       and "alias === base" would hold while both sides are wrong. Assert the
+       base is genuinely ready first, then that the alias inherits it. */
+    assert.strictEqual(T.compPriceReady('BTC'), true, 'fixture must make the BASE comp-ready');
+    assert.strictEqual(T.compPriceReady('BTC-HOT'), true, 'alias must inherit the base verdict');
+    assert.strictEqual(T.compPriceReady('BTC-BOOST'), true, 'boost alias must inherit it too');
+    /* The exact paths that froze round6 on 2026-09-01. A zero cap raises
+       UnpricedError, and onSweepError turns that into a whole-round pause, so
+       holding a position on a freshly opened Hot ticker stopped every
+       contestant, including from closing, until the bell. */
+    assert.strictEqual(T.qualityLeverageCap('BTC-HOT'), Infinity, 'a segment ticker must carry a leverage cap');
+    assert.strictEqual(T.readyForLeverage('BTC-BOOST', 500), true, 'boost leverage must be allowed on the alias');
+    assert.strictEqual(T.boostLevCap('BTC-BOOST', 500), 500, 'the armed boost cap must survive the alias');
+  });
+  await ok('the top tier refuses a source whose age cannot be measured', () => {
+    const t = Date.now();
+    /* Only arrival-stamped venues. Binance bookTicker and Coinbase carry no
+       provider time, so during a Lazer outage the engine cannot tell a 20ms
+       quote from a 2s one, and 500x on that is the one combination it must
+       not authorise. The market stays open at the ordinary tier. */
+    T.compUpdate('ETH', 'usdt', 100, t);
+    T.compUpdate('ETH', 'usd', 100, t);
+    assert.strictEqual(T.compPriceReady('ETH'), true, 'an unageable source still prices the market');
+    assert.strictEqual(T.readyForLeverage('ETH', 100), true, 'the ordinary tier keeps trading');
+    assert.strictEqual(T.readyForLeverage('ETH', 500), false, 'the top tier is refused');
+    assert.strictEqual(T.boostLevCap('ETH', 500), 100, 'and the advertised cap says so');
   });
 
   console.log('\nsegment gating');
@@ -157,8 +199,8 @@ mktCfg.set('BTC', {
   /* A suite that prints its summary before its cases have run is not a
      suite. Assert the count so a future promise-returning case cannot be
      silently dropped again. */
-  if (pass + fails !== 14) {
-    console.log(`  FAIL only ${pass + fails}/14 cases ran`);
+  if (pass + fails !== 16) {
+    console.log(`  FAIL only ${pass + fails}/16 cases ran`);
     process.exitCode = 1;
   }
 })();

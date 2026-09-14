@@ -1,4 +1,6 @@
 #!/usr/bin/env node
+throw new Error('Retired legacy fault drill: do not run this against a service or database. Use npm test for isolated fixtures; any production rehearsal requires separate authorization and DEPLOY.md.');
+// Archival body retained below for provenance; unreachable by design.
 /* Fault-injection rehearsal.
  *
  *   sudo -u ubuntu PAPER_COMP_TOKEN=... node rehearse.js
@@ -9,14 +11,15 @@
  * is where they meet a real feed, a real database and each other.
  *
  * What it injects, in order:
- *   1. a restart during the Hot window        -> gates must rehydrate
- *   2. a restart just after the draw commits  -> draw must survive, not block
+ *   1. a restart during the sealed warning    -> active time and secrecy survive
+ *   2. a restart during Hot Market #1         -> the revealed ordinary market resumes
  *   3. an operator mistake mid-round          -> must be refused
- *   4. the bell arriving while the engine is  -> result must still be settled
- *      busy                                      and priced at the bell
+ *   4. real Hot #2, Final Build and 500x      -> frozen bankroll and result proof agree
+ *      Boost traffic through the bell
  *
- * It uses clearly-marked throwaway accounts and removes everything it created,
- * including on failure. Nothing here touches a real trader's account.
+ * It uses clearly-marked throwaway accounts. Live exposure and orders are
+ * cleaned even on failure; the settled/aborted round, fills and proof rows are
+ * retained as immutable audit evidence. Nothing touches a real trader account.
  */
 const http = require('node:http');
 const { execFileSync } = require('node:child_process');
@@ -90,6 +93,31 @@ const positionsOf = (userId) => {
 
 const state = () => req('GET', '/api/paper/comp/state');
 
+async function abortRehearsal(reason) {
+  let ordinary = null;
+  try { ordinary = await admin('abort', { id: ROUND }); } catch { /* inspect below */ }
+  if (ordinary && ordinary.code >= 200 && ordinary.code < 300 && ordinary.body?.ok) return;
+  await sleep(400);                       // let the state micro-cache turn over
+  const response = await state();
+  if (response.code < 200 || response.code >= 300 || !response.body?.ok) {
+    throw new Error(`cleanup state failed (${response.code})`);
+  }
+  const observed = response.body;
+  const live = observed.live && observed.round?.id === ROUND ? observed : null;
+  const armed = (observed.armed || []).find((row) => row.id === ROUND) || null;
+  if (!live && !armed) return;
+  if (!(live?.blocked || live?.blockedReason || armed?.blockedReason)) {
+    throw new Error(`ordinary cleanup abort refused while ${ROUND} remains unblocked`);
+  }
+  const forced = await admin('forceAbort', {
+    id: ROUND,
+    reason: `automated fault-rehearsal cleanup: ${String(reason || 'rehearsal failure').slice(0, 150)}`,
+  });
+  if (forced.code < 200 || forced.code >= 300 || !forced.body?.ok) {
+    throw new Error(`forceAbort failed (${forced.code}): ${forced.body?.error || 'unknown error'}`);
+  }
+}
+
 function restartEngine(why) {
   console.log(`   ... restarting engine (${why})`);
   execFileSync('sudo', ['systemctl', 'restart', 'phoenix-paper'], { stdio: 'ignore' });
@@ -114,27 +142,35 @@ async function waitPhase(phase, timeoutMs = 90_000) {
     await sleep(400);
   }
 }
+async function waitHot(number, timeoutMs = 120_000) {
+  const t0 = Date.now();
+  for (;;) {
+    const s = await state().catch(() => null);
+    const body = s && s.body;
+    if (body && body.phase === 'hot' && Number(body.hotNumber) === Number(number)
+        && body.hot && Number(body.hot.number) === Number(number)) return body;
+    if (body && body.blocked) return body;
+    if (Date.now() - t0 > timeoutMs) return null;
+    await sleep(400);
+  }
+}
 
 async function cleanup() {
   step('cleanup');
-  try { await admin('abort', { id: ROUND }); } catch { /* may already be finished */ }
-  // remove the throwaway accounts and this round's rows
+  try { await abortRehearsal('fault-injection rehearsal finished with failures'); }
+  catch (e) { bad('round cleanup failed: ' + e.message); }
+  // Remove executable residue, but preserve the round/fills/proofs. A current
+  // v2 result is intentionally immutable and deleting it would defeat the
+  // rehearsal's commit/reveal and execution audit.
   const script = `
     const a = require('/opt/phoenix-paper/auth-shim.js');
     const ids = ${JSON.stringify(IDS)};
     const d = a.db;
-    d.prepare("DELETE FROM paper_round_scores WHERE round_id = ?").run('${ROUND}');
-    d.prepare("DELETE FROM paper_round_players WHERE round_id = ?").run('${ROUND}');
-    d.prepare("DELETE FROM paper_round_boundaries WHERE round_id = ?").run('${ROUND}');
-    d.prepare("DELETE FROM paper_rounds WHERE id = ?").run('${ROUND}');
     for (const id of ids) {
       d.prepare('DELETE FROM paper_positions WHERE user_id = ?').run(id);
-      d.prepare('DELETE FROM paper_orders WHERE user_id = ?').run(id);
-      d.prepare('DELETE FROM paper_fills WHERE user_id = ?').run(id);
-      d.prepare('DELETE FROM paper_accounts WHERE user_id = ?').run(id);
-      d.prepare('DELETE FROM users WHERE id = ?').run(id);
+      d.prepare("UPDATE paper_orders SET status='CANCELLED', closed_at=? WHERE user_id=? AND status='OPEN'").run(Date.now(), id);
     }
-    console.log('removed rehearsal rows and accounts');
+    console.log('removed executable residue; preserved round ${ROUND} and immutable audit evidence');
   `;
   try {
     console.log('   ' + execFileSync('node', ['-e', script], { encoding: 'utf8' }).trim());
@@ -159,12 +195,23 @@ async function cleanup() {
 
     step('arm and pre-flight');
     let r = await admin('create', {
-      id: ROUND, kind: 'rehearsal', candidates: ['BTC', 'SOL', 'ETH'], backup: 'XRP',
+      id: ROUND, kind: 'rehearsal', candidates: ['BTC', 'SOL', 'ETH', 'XRP'],
       players: IDS.map((u, i) => ({ userId: u, displayName: `Seat ${i + 1}`, seat: i })),
     });
-    r.body.ok ? ok(`armed, commit ${String(r.body.round.draw_commit).slice(0, 12)}…`)
-              : bad('arm failed: ' + JSON.stringify(r.body));
+    if (!r.body.ok) bad('arm failed: ' + JSON.stringify(r.body));
+    else if (r.body.round && r.body.round.drawCommit != null) {
+      bad('armed response leaked sealed draw material');
+    } else ok('armed with one eligible-market pool; draw remains sealed');
     r = await admin('preflight', { id: ROUND });
+    /* A drill restarts the engine on purpose, which empties the reliability
+       history production now demands. That is exactly the case the override
+       exists for, so the drill takes it explicitly and audibly rather than
+       being silently exempt. */
+    if (!r.body.marketsReady && /reliability history/.test(r.body.marketsError || '')) {
+      await admin('overrideReadiness', { id: ROUND, why: 'rehearsal on a deliberately restarted engine' });
+      console.log('   note   readiness overridden: this drill restarts the engine by design');
+      r = await admin('preflight', { id: ROUND });
+    }
     r.body.marketsReady ? ok('market data ready') : bad('markets not ready: ' + JSON.stringify(r.body.markets));
     r.body.seatsReady ? ok('seats ready') : bad('seats not ready');
 
@@ -182,15 +229,19 @@ async function cleanup() {
       global.__before = before;
     }
 
-    step('fault 1: restart just after the draw commits');
-    let s = await waitPhase('reveal');
-    if (!s) { bad('never reached the reveal'); } else {
-      ok(`drew ${s.hot && s.hot.market}`);
-      restartEngine('post-draw');
+    step('fault 1: restart during the sealed Hot #1 warning');
+    let s = await waitPhase('hotWarning');
+    if (!s || Number(s.hotNumber) !== 1) { bad('never reached Hot #1 warning'); } else if (s.hot || (s.hots || []).length) {
+      bad('warning revealed an asset before activation');
+    } else {
+      ok('generic warning is live and the asset is still sealed');
+      restartEngine('Hot #1 warning');
       if (!(await waitUp())) { bad('engine did not come back'); } else {
         s = (await state()).body;
-        if (s.blocked) bad('a persisted draw should NOT block: ' + s.blockedReason);
-        else ok('survived the restart without blocking');
+        if (s.blocked) bad('warning restart blocked: ' + s.blockedReason);
+        else if (s.phase === 'hotWarning' && (s.hot || (s.hots || []).length)) {
+          bad('restart leaked the sealed Hot #1 market');
+        } else ok(`survived warning restart in ${s.phase} without leaking or blocking`);
         /* Position identity must survive a restart exactly: same symbol, side,
            size, entry and margin mode. A phantom fill or a silent liquidation
            here would be invisible to a drill that carried no exposure. */
@@ -201,42 +252,63 @@ async function cleanup() {
       }
     }
 
-    step('fault 2: restart during the Hot window');
-    s = await waitPhase('hot');
-    if (!s || s.blocked) { bad('never reached Hot' + (s && s.blockedReason ? ': ' + s.blockedReason : '')); } else {
-      ok(`hot open on ${s.hot.market}`);
-      restartEngine('mid-Hot');
+    step('fault 2: restart during Hot Market #1');
+    s = await waitHot(1);
+    let firstHotMarket = null;
+    if (!s || s.blocked) { bad('never reached Hot #1' + (s && s.blockedReason ? ': ' + s.blockedReason : '')); } else {
+      firstHotMarket = s.hot.market;
+      ok(`Hot #1 active on ordinary market ${firstHotMarket}`);
+      restartEngine('mid-Hot #1');
       if (!(await waitUp())) { bad('engine did not come back'); } else {
-        /* Recovery is not instant and should not be: the composite index has
-           to resume before a ticker can be priced, and the engine retries
-           until it can. Poll for the gate rather than sampling once and
-           calling a slow recovery a failure. */
+        /* Recovery waits for the same revealed market's composite price. V2
+           Hot has no synthetic gate/ticker to recreate. */
         const t0 = Date.now();
         let restored = false;
         for (;;) {
           s = (await state().catch(() => ({ body: {} }))).body;
           if (s.blocked) { bad('blocked after restart: ' + s.blockedReason); break; }
-          if (s.phase !== 'hot') { bad(`Hot window ended before the gate came back (phase ${s.phase}) after ${Date.now() - t0}ms`); break; }
-          if (s.hot && s.hot.open) { restored = true; break; }
-          if (Date.now() - t0 > 20_000) { bad('Hot gate never rehydrated within 20s'); break; }
+          if (s.phase !== 'hot' || Number(s.hotNumber) !== 1) { bad(`Hot #1 ended before recovery (phase ${s.phase}) after ${Date.now() - t0}ms`); break; }
+          if (s.hot && s.hot.market === firstHotMarket && !s.paused) { restored = true; break; }
+          if (Date.now() - t0 > 25_000) { bad('Hot #1 did not resume within 25s'); break; }
           await sleep(500);
         }
-        if (restored) ok(`gates rehydrated after ${Date.now() - t0}ms`);
+        if (restored) ok(`same Hot #1 market resumed after ${Date.now() - t0}ms`);
       }
     }
 
-    step('fault 2b: trade the Hot segment, then restart again');
+    step('trade the ordinary market during Hot #1');
     {
       s = (await state().catch(() => ({ body: {} }))).body;
-      if (s.live && s.hot && s.hot.open) {
-        const r2 = await trade(IDS[0], { symbol: s.hot.ticker, side: 'BUY', type: 'MARKET', notionalUsd: 1, leverage: 10 });
-        r2.code === 200 ? ok(`hot exposure open on ${s.hot.ticker}`)
+      if (s.live && s.phase === 'hot' && Number(s.hotNumber) === 1 && s.hot) {
+        /* A restart empties the engine's source memory, so for the recovery
+           grace nothing is competition-valid and the SHARED PAUSE is held: no
+           liquidations, no drawdown, and — correctly — no trading either.
+           Wait for it to lift, which is what a show would do, rather than
+           asserting a trade the rules currently forbid. */
+        const tp = Date.now();
+        while (Date.now() - tp < 25_000) {
+          const cur = (await state().catch(() => ({ body: {} }))).body;
+          if (!cur.paused) break;
+          await sleep(500);
+        }
+        const stillPaused = ((await state().catch(() => ({ body: {} }))).body || {}).paused;
+        if (stillPaused) {
+          bad(`still paused after 25s: ${JSON.stringify(stillPaused.symbols)}`);
+        } else {
+          ok(`shared pause lifted ${Date.now() - tp}ms after the restart`);
+        }
+        const r2 = await trade(IDS[0], { symbol: s.hot.market, side: 'BUY', type: 'MARKET', notionalUsd: 1, leverage: 10 });
+        r2.code === 200 ? ok(`Hot #1 exposure traded on ${s.hot.market}`)
                         : bad('hot order refused: ' + JSON.stringify(r2.body));
-        const hotPos = positionsOf(IDS[0]).filter((p) => p.symbol.endsWith('-HOT'));
-        hotPos.length ? ok('hot leg is a separate position, as designed')
-                      : bad('no hot position created');
+        const held = positionsOf(IDS[0]);
+        held.some((p) => p.symbol === s.hot.market)
+          ? ok('Hot movement accrues on the ordinary position')
+          : bad('ordinary Hot position is missing');
+        held.some((p) => p.symbol.endsWith('-HOT'))
+          ? bad('v2 created a retired synthetic -HOT position')
+          : ok('no synthetic -HOT ticker was created');
       } else {
-        bad('Hot window not open when expected');
+        bad('Hot #1 window not open when expected');
       }
     }
 
@@ -245,23 +317,77 @@ async function cleanup() {
     r.code === 409 ? ok('resetPlayers refused on a live round')
                    : bad(`resetPlayers returned ${r.code}: ${JSON.stringify(r.body)}`);
 
-    step('fault 4: ride to the bell');
+    step('observe and trade Hot Market #2');
+    s = await waitHot(2);
+    if (!s || s.blocked) {
+      bad('never reached Hot #2' + (s && s.blockedReason ? ': ' + s.blockedReason : ''));
+    } else {
+      const secondHotMarket = s.hot.market;
+      secondHotMarket && secondHotMarket !== firstHotMarket
+        ? ok(`Hot #2 is distinct: ${secondHotMarket}`)
+        : bad(`Hot markets were not distinct (${firstHotMarket}, ${secondHotMarket})`);
+      const r2 = await trade(IDS[1], { symbol: secondHotMarket, side: 'SELL',
+        type: 'MARKET', notionalUsd: 1, leverage: 10 });
+      r2.code === 200 ? ok(`Hot #2 exposure traded on ${secondHotMarket}`)
+                      : bad('Hot #2 order refused: ' + JSON.stringify(r2.body));
+    }
+
+    step('Final Build publishes projected 500x capacity');
+    s = await waitPhase('finalBuild', 120_000);
+    if (!s || s.blocked) bad('never reached Final Build');
+    else {
+      const projected = (s.players || []).filter((p) => Number.isFinite(Number(p.projectedBoostPower)));
+      projected.length === IDS.length
+        ? ok(`projected Boost power published for ${projected.length} seats`)
+        : bad(`projected Boost power missing for ${IDS.length - projected.length} seat(s)`);
+    }
+
+    step('fault 4: trade 500x Boost under the round capacity policy and ride to the bell');
+    s = await waitPhase('boost', 90_000);
+    if (!s || s.blocked || !s.boostOpen || !(s.boostMarkets || []).length) {
+      bad('Boost never opened: ' + JSON.stringify(s && { phase: s.phase, blocked: s.blocked, markets: s.boostMarkets }));
+    } else {
+      const boostLeverage = Number(s.round && s.round.boostLeverage) || 500;
+      const player = (s.players || []).find((p) => Number(p.userId) === IDS[0]);
+      const policy = s.round?.boostCapacityPolicy ?? 'frozen-start-v1';
+      const bankroll = policy === 'current-equity-v1' ? player?.equity : player?.boostBankroll;
+      const tolerance = policy === 'current-equity-v1'
+        ? 0.0000005 * boostLeverage + 0.0000005 : 1e-6;
+      if (['current-equity-v1', 'frozen-start-v1'].includes(policy)
+          && Number.isFinite(player?.boostBankroll) && Number.isFinite(bankroll)
+          && Number.isFinite(player?.boostMaxExposure)
+          && Math.abs(player.boostMaxExposure - Math.max(0, bankroll) * boostLeverage)
+            <= tolerance + Number.EPSILON * Math.abs(player.boostMaxExposure)) {
+        ok(`${policy}: max exposure ${player.boostMaxExposure}; Boost-start equity ${player.boostBankroll}`);
+      } else bad(`Boost capacity does not match the round's ${boostLeverage}x policy`);
+      const boostSymbol = s.boostMarkets[0] + '-BOOST';
+      const br = await trade(IDS[0], { symbol: boostSymbol, side: 'BUY', type: 'MARKET',
+        notionalUsd: 1, leverage: boostLeverage });
+      br.code === 200 ? ok(`${boostLeverage}x Boost order accepted on ${boostSymbol}`)
+                      : bad('Boost order refused: ' + JSON.stringify(br.body));
+    }
     for (let i = 0; i < 240; i++) {
       s = (await state().catch(() => ({ body: {} }))).body;
       if (!s.live) break;
       await sleep(1000);
     }
-    /* The Hot leg must have been force-closed by its own boundary and scored
-       at 2x, while the base leg is still open and marked at the bell. */
+    /* Hot uses the ordinary position and does not force-close it. Only event
+       Boost aliases are flattened at their shared bell mark. */
     {
       const left = positionsOf(IDS[0]);
       left.some((p) => p.symbol.endsWith('-HOT'))
-        ? bad('a Hot position survived its segment: ' + JSON.stringify(left))
-        : ok('hot leg settled by its segment, base leg left open');
+        ? bad('a retired synthetic Hot position exists: ' + JSON.stringify(left))
+        : ok('both Hot windows used ordinary positions only');
+      left.some((p) => p.symbol.endsWith('-BOOST'))
+        ? bad('a Boost position survived the bell: ' + JSON.stringify(left))
+        : ok('Boost aliases settled at the shared bell');
       left.some((p) => !p.symbol.includes('-'))
         ? ok('base position marked at the bell, not force-closed')
         : bad('the base position vanished: ' + JSON.stringify(left));
     }
+    if (s && s.lastRound && Array.isArray(s.lastRound.hots)
+        && s.lastRound.hots.length === 2) ok('recap contains both Hot Markets');
+    else bad('recap does not contain two Hot Markets');
 
     r = await admin('standings', { id: ROUND, checkpoint: 'final' });
     const board = (r.body && r.body.board) || [];
@@ -275,14 +401,14 @@ async function cleanup() {
       const drift = row.at - row.scheduled_at;
       console.log(`   note   bell ran ${drift}ms after it was due (priced at the due instant)`);
     }
-    r = await admin('firstFive', { id: ROUND });
-    'winner' in (r.body || {}) ? ok('First Five resolved') : bad('First Five missing');
-
-    step('verify the draw publicly');
+    step('verify the draw and execution publicly');
     r = await req('GET', `/api/paper/comp/verify?round=${ROUND}`);
-    r.body && r.body.verified && r.body.verified.ok
-      ? ok(`draw verifies (${r.body.drawn}${r.body.verified.fellBack ? ', fell back to ' + r.body.verified.traded : ''})`)
+    r.body && r.body.verified && r.body.verified.ok && r.body.canonical && r.body.canonical.matches
+      ? ok('committed two-Hot draw verifies')
       : bad('draw does NOT verify: ' + JSON.stringify(r.body && r.body.verified));
+    r.body && r.body.execution && r.body.execution.verified
+      ? ok('active-time, Hot score, Boost-start reference and final score execution proof verifies')
+      : bad('execution does NOT verify: ' + JSON.stringify(r.body && r.body.execution && r.body.execution.checks));
   } catch (e) {
     bad('rehearsal threw: ' + e.message);
   } finally {

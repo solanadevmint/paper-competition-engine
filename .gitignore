@@ -1,6 +1,11 @@
 node_modules/
 *.db
-*.db-wal
 *.db-shm
-*.stale-*
+*.db-wal
+*.log
+*.bak*
 .env
+.env.*
+!.env.example
+releases/
+scratch/

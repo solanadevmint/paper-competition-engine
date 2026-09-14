@@ -1,4 +1,6 @@
 'use strict';
+throw new Error('Retired legacy table copier: it must not replace an existing ledger. Use the verified backup/restore and guarded migration procedure in DEPLOY.md.');
+// Archival body retained below for provenance; unreachable by design.
 // One-shot: copy paper_* tables from the phoenix-teams users.db into the
 // isolated paper.db. Run ON THE PERP.SO BOX during the cutover freeze, then
 // scp the produced file to the paper box:

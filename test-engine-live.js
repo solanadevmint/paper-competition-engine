@@ -1,3 +1,5 @@
+throw new Error('Retired legacy live-data suite: its old scratch guard is not safe. Use npm test for isolated fixtures; an external-feed rehearsal requires a separately approved disposable environment.');
+// Archival body retained below for provenance; unreachable by design.
 /* Live-data integration test.
  *
  *   PAPER_DB=$(mktemp -u --suffix=.db) node test-engine-live.js
@@ -181,9 +183,10 @@ const balOf = (uid) => T.stmt.acctGet.get(uid).balance;
   }
 
   console.log('\ncompetition layer on live prices');
-  comp.wire({ openAlias: T.openAlias, closeAlias: T.closeAlias, scoreUser: T.scoreUser, log: () => {} });
+  comp.wire({ openAlias: T.openAlias, closeAlias: T.closeAlias, scoreUser: T.scoreUser,
+    scoreProofFor: T.scoreProofFor, log: () => {} });
   comp.createRound({
-    id: 'live', candidates: [BIG, 'SOL'],
+    id: 'live', candidates: [BIG, 'SOL', 'ETH'],
     players: [{ userId: USER, displayName: 'Live', seat: 0 }],
   });
   comp.startRound('live');
