@@ -193,7 +193,10 @@ const BOT_SEATS = 8;
    unbounded roster work or create a round no client can represent. */
 const MAX_ROSTER_SEATS = 32;
 const isBotId = (id) => Number.isSafeInteger(Number(id)) && Number(id) >= BOT_ID_BASE && Number(id) < BOT_ID_BASE + 1000;
-const isPracticeSeries = (series) => /^(?:practice|ops-rehearsal)(?:$|[:~])/i.test(String(series || '').trim());
+/* Any night whose name starts with "practice" is practice. The old rule
+   wanted exactly "practice" or "practice:" and treated "practiceba" as a show
+   night, which put official prize placings on the desk for a rehearsal. */
+const isPracticeSeries = (series) => /^(?:practice|ops-rehearsal)/i.test(String(series || '').trim());
 const isPracticeRound = (r) => !!(r && (r.solo || r.kind === 'rehearsal' || isPracticeSeries(r.series)));
 const botIdForSeat = (seat) => BOT_ID_BASE + Number(seat);
 /* How long a drawn Hot Market gets to become priceable before the backup is
@@ -1850,6 +1853,55 @@ const BRACKET = [
  *  out, ordered by their semi-final PnL. Returns [] until the final is done,
  *  because a placing that can still change is not a placing.
  */
+/* Every night the desk has run, newest first, archived nights included. A
+   round row is what the round wrote when it settled: the board is the frozen
+   standings, never a recomputation, so the history can only repeat what the
+   result said. Practice nights carry no prize placings. Read-only. */
+function nightHistory({ limit = 30 } = {}) {
+  const max = Math.min(100, Math.max(1, Number(limit) || 30));
+  const rows = db.prepare(`SELECT * FROM paper_rounds
+    WHERE status IN ('done', 'aborted') AND started_at IS NOT NULL
+    ORDER BY COALESCE(ends_at, updated_at, started_at) DESC LIMIT 2000`).all();
+  const nights = new Map();
+  for (const r of rows) {
+    const tag = r.series || '';
+    const name = tag.replace(/~archived-\d+$/, '') || '(no series)';
+    const archivedAt = (tag.match(/~archived-(\d{12})$/) || [])[1] || null;
+    if (!nights.has(tag)) {
+      nights.set(tag, { series: tag, name, archived: !!archivedAt, archivedAt, practice: isPracticeSeries(name), rounds: [] });
+    }
+    const night = nights.get(tag);
+    if (night.rounds.length >= 40) continue;
+    let board = [];
+    if (r.status === 'done') { try { board = standings(r.id, 'final'); } catch { board = []; } }
+    let roster = [];
+    try { roster = q.players.all(r.id); } catch { roster = []; }
+    const seatOf = new Map(roster.map((p) => [p.user_id, p.seat]));
+    const nameOf = new Map(roster.map((p) => [p.user_id, p.display_name || null]));
+    night.rounds.push({
+      id: r.id, kind: r.kind, stage: r.stage || null, status: r.status,
+      startedAt: r.started_at || null, endedAt: r.ends_at || null, settledAt: r.updated_at || null,
+      advance: r.advance || null, solo: !!r.solo, practice: isPracticeRound(r),
+      players: roster.map((p) => ({ userId: p.user_id, seat: p.seat, name: p.display_name || null })),
+      board: board.map((b) => ({
+        rank: b.rank, userId: b.user_id, seat: seatOf.get(b.user_id) ?? null, name: nameOf.get(b.user_id) || null,
+        score: b.score, maxDrawdown: b.maxDrawdown,
+        through: r.advance && r.status === 'done' ? b.rank <= r.advance : null,
+      })),
+    });
+  }
+  const out = [...nights.values()].slice(0, max);
+  for (const n of out) {
+    n.rounds.reverse();
+    const finalR = [...n.rounds].reverse().find((x) => x.status === 'done' && (x.kind === 'final' || x.stage === 'The Final'));
+    n.winner = finalR && finalR.board[0] ? { userId: finalR.board[0].userId, name: finalR.board[0].name, score: finalR.board[0].score } : null;
+    let placings = [];
+    if (!n.practice) { try { placings = stopPlacings(n.series); } catch { placings = []; } }
+    n.placings = placings;
+  }
+  return { nights: out, total: nights.size };
+}
+
 function visibleSeriesRounds(series, doneOnly = false) {
   return db.prepare(`SELECT r.* FROM paper_rounds r
     WHERE r.series = ? AND r.status IN ('armed', 'running', 'done')
@@ -5169,6 +5221,7 @@ module.exports = {
   createRound, startRound, abortRound, currentRound, playersOf, accountLocked, clearBlock, blockRound, sampleDrawdown, otherRoundsOwning,
   marketReadiness, overrideReadiness, marketReliabilityOf,
   wallState, setWall, seriesBoard, stopPlacings, STOP_PRIZE, WALL_MODES, BRACKET, planOf, scaledPlan, SPEEDS, resetNight,
+  nightHistory,
   isBotId, botIdForSeat, BOT_ID_BASE, isPracticeRound, isPracticeSeries,
   scheduleStart, cancelScheduledStart, resumeScheduledStarts,
   inviteState, claimInvite, setInviteReady, setReadyByUser, readinessOf,

@@ -184,6 +184,32 @@ const abort = () => {
     assert.strictEqual(CT.q.get.get('ghost'), undefined);
   });
 
+  await test('any night named practice-anything is practice, so it carries no prize placings', () => {
+    for (const name of ['practice', 'practice:seoul', 'practiceba', 'Practice night 3', 'ops-rehearsal-20260904'])
+      assert.strictEqual(comp.isPracticeSeries(name), true, name);
+    for (const name of ['seoul', 'singapore-final', 'london', ''])
+      assert.strictEqual(comp.isPracticeSeries(name), false, name);
+    assert.deepStrictEqual(comp.stopPlacings('practiceba'), []);
+  });
+
+  await test('night history lists settled rounds newest night first with frozen boards', () => {
+    const r = comp.createRound({ id: 'history-1', kind: 'rehearsal', series: 'practiceba', candidates: ['BTC', 'ETH', 'SOL'], players: seat });
+    comp.startRound(r.id);
+    comp.abortRound(r.id, { force: true });
+    const h = comp.nightHistory({ limit: 5 });
+    assert.ok(Array.isArray(h.nights) && h.nights.length >= 1);
+    const night = h.nights.find((n) => n.series === 'practiceba');
+    assert.ok(night, 'the practiceba night is listed');
+    assert.strictEqual(night.practice, true);
+    assert.deepStrictEqual(night.placings, []);
+    const round = night.rounds.find((x) => x.id === 'history-1');
+    assert.ok(round, 'the aborted round is in the night');
+    assert.strictEqual(round.status, 'aborted');
+    assert.ok(Array.isArray(round.board) && Array.isArray(round.players));
+    for (const n of h.nights) for (const x of n.rounds) assert.ok(['done', 'aborted'].includes(x.status));
+    assert.ok(h.nights.every((n) => typeof n.name === 'string' && typeof n.archived === 'boolean'));
+  });
+
   console.log(`\ncompetition lifecycle: ${pass}/${pass + fail} passed`);
   process.exitCode = fail ? 1 : 0;
 })();

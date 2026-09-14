@@ -8628,7 +8628,7 @@ async function compAdmin(req, res) {
      the desk can observe the drain; every action that can change round, wall,
      schedule, account or safety state is refused without even writing an
      operator-log row (the deploy is waiting for SQLite to go idle). */
-  const readOnlyActions = new Set(['log', 'standings', 'preflight']);
+  const readOnlyActions = new Set(['log', 'standings', 'preflight', 'history']);
   const knownActions = new Set([
     ...readOnlyActions,
     'create', 'wall', 'start', 'abort', 'forceAbort', 'settleAtPrior',
@@ -8711,6 +8711,10 @@ async function compAdmin(req, res) {
         return send(res, 400, { ok: false, error: `unknown checkpoint: ${body.checkpoint} (expected ${CKPT.join(', ')})` });
       }
       return send(res, 200, { ok: true, board: comp.standings(body.id, body.checkpoint || 'final') });
+    }
+    if (a === 'history') {
+      /* Nights and their settled rounds for the desk, archived ones included. */
+      return send(res, 200, { ok: true, ...comp.nightHistory({ limit: body.limit }) });
     }
     if (a === 'forceAbort') {
       if (!body.reason || !String(body.reason).trim()) return send(res, 400, { ok: false, error: 'forceAbort requires a reason' });

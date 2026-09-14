@@ -5,7 +5,7 @@ the engine behind the Frontier Traders World Cup stops (Seoul, Singapore, the
 London final) and behind the paper terminal at [perp.so/ftpaper](https://perp.so/ftpaper).
 
 This repository is the production source, published as deployed. The five
-runtime files are byte for byte the build that is live, `eafbc36dab2f06db`
+runtime files are byte for byte the build that is live, `8f63a262d0844c84`
 (hashes below). What is not here: the deployment runbook, host inventory,
 secrets, and the production database.
 
@@ -104,7 +104,7 @@ npm run test:live # the one suite that needs a running engine and the network
 ```
 
 The deterministic suites run with no network and no production data. On the
-files in this repository they pass 547 checks across 16 suites: service
+files in this repository they pass 495 checks across 16 suites: service
 resilience, candles, source expiry, market diagnostics, engine review,
 competition push, the two-Hot format, alias tickers, competition lifecycle,
 scoring, engine deep checks, the competition API, integrity, migration, review
@@ -127,11 +127,11 @@ All routes sit under `/api/paper/` behind the gate.
 
 ## Provenance
 
-SHA-256 of the runtime files, matching the live build `eafbc36dab2f06db`:
+SHA-256 of the runtime files, matching the live build `8f63a262d0844c84`:
 
 ```
-paper.js        96e50d101523cf92d1a7f2e224c07dea54d3980507df7f2e5f8a20970f64026b
-competition.js  f00e97477a04a75269644fc2930d3154c9adb7d4fa2e066aa1deb8b1223251cc
+paper.js        f4f0e57ad9ce5c81f753c0a97ece27db4f9f9febdb35d979b582e73589f77da0
+competition.js  36cb4258ead0c24478692c2b7dee4931f1e9881c120c0f8fe226ae4f8acaf2c2
 server.js       06aa3c8884c441205eada58bd2d27a236919bceca1bf951dda234926cf00e836
 auth-shim.js    4707d6a7467977dd8f2598275a109c2a45b82a77f51193d80fa7213c4d168abc
 bots.js         6cb27cbe4822bb274e91462135f9e6cb9f56f1fcef0359bde8b942cd2b616432

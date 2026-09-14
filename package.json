@@ -1,6 +1,6 @@
 {
   "name": "paper-competition-engine",
-  "version": "2026.9.13",
+  "version": "2026.9.14",
   "description": "Perps paper-trading engine with a live competition layer (two Hot Markets, 500x Boost, verifiable draw, per-seat proofs).",
   "main": "server.js",
   "scripts": {
